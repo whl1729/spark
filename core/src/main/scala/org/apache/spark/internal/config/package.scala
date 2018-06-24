@@ -138,7 +138,7 @@ package object config {
       .booleanConf
       .createWithDefault(false)
 
-  private[spark] val DYN_ALLOCATION_RECOVERY_TIMEOUT =
+  private[spark] val DYN_ALLOCATION_CACHE_RECOVERY_TIMEOUT =
     ConfigBuilder("spark.dynamicAllocation.cacheRecovery.timeout")
       .timeConf(TimeUnit.SECONDS)
       .createWithDefault(120)

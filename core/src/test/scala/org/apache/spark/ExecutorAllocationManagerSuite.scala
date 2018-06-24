@@ -1346,4 +1346,6 @@ private class DummyLocalSchedulerBackend (sc: SparkContext, sb: SchedulerBackend
   override def killExecutorsOnHost(host: String): Boolean = {
     false
   }
+
+  override def markPendingToRemove(executorIds: Seq[String]): Unit = Seq.empty
 }
