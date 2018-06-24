@@ -133,6 +133,16 @@ package object config {
   private[spark] val SHUFFLE_SERVICE_ENABLED =
     ConfigBuilder("spark.shuffle.service.enabled").booleanConf.createWithDefault(false)
 
+  private[spark] val DYN_ALLOCATION_CACHE_RECOVERY =
+    ConfigBuilder("spark.dynamicAllocation.cacheRecovery.enabled")
+      .booleanConf
+      .createWithDefault(false)
+
+  private[spark] val DYN_ALLOCATION_RECOVERY_TIMEOUT =
+    ConfigBuilder("spark.dynamicAllocation.cacheRecovery.timeout")
+      .timeConf(TimeUnit.SECONDS)
+      .createWithDefault(120)
+
   private[spark] val KEYTAB = ConfigBuilder("spark.yarn.keytab")
     .doc("Location of user's keytab.")
     .stringConf.createOptional

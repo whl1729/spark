@@ -33,7 +33,11 @@ private[spark] object BlockManagerMessages {
   case class RemoveBlock(blockId: BlockId) extends ToBlockManagerSlave
 
   // Replicate blocks that were lost due to executor failure
-  case class ReplicateBlock(blockId: BlockId, replicas: Seq[BlockManagerId], maxReplicas: Int)
+  case class ReplicateBlock(
+      blockId: BlockId, 
+      replicas: Seq[BlockManagerId], 
+      excluding: Seq[BlockManagerId],
+      maxReplicas: Int)
     extends ToBlockManagerSlave
 
   // Remove all blocks belonging to a specific RDD.
@@ -123,4 +127,7 @@ private[spark] object BlockManagerMessages {
   case class BlockManagerHeartbeat(blockManagerId: BlockManagerId) extends ToBlockManagerMaster
 
   case class HasCachedBlocks(executorId: String) extends ToBlockManagerMaster
+  
+  case class RecoverLatestRDDBlock(executorId: String, excludingExecs: Seq[String])
+    extends ToBlockManagerMaster
 }
