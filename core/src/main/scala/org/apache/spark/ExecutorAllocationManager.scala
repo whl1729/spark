@@ -107,10 +107,10 @@ private[spark] class ExecutorAllocationManager(
 
   // How long an executor must be idle for before it is removed (seconds)
   private val executorIdleTimeoutS = conf.getTimeAsSeconds(
-    "spark.dynamicAllocation.executorIdleTimeout", "60s")
+    "spark.dynamicAllocation.executorIdleTimeout", "1s")
 
   private val cachedExecutorIdleTimeoutS = conf.getTimeAsSeconds(
-    "spark.dynamicAllocation.cachedExecutorIdleTimeout", s"${Integer.MAX_VALUE}s")
+    "spark.dynamicAllocation.cachedExecutorIdleTimeout", "1s")
 
   // whether or not to try and save cached data when executors are deallocated
   private val recoverCachedData = conf.get(DYN_ALLOCATION_CACHE_RECOVERY)
