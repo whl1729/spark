@@ -131,7 +131,7 @@ package object config {
     .createWithDefaultString("3s")
 
   private[spark] val SHUFFLE_SERVICE_ENABLED =
-    ConfigBuilder("spark.shuffle.service.enabled").booleanConf.createWithDefault(false)
+    ConfigBuilder("spark.shuffle.service.enabled").booleanConf.createWithDefault(true)
 
   private[spark] val DYN_ALLOCATION_CACHE_RECOVERY =
     ConfigBuilder("spark.dynamicAllocation.cacheRecovery.enabled")
