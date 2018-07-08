@@ -309,20 +309,27 @@ private[spark] class ExecutorAllocationManager(
   private def schedule(): Unit = synchronized {
     val now = clock.getTimeMillis
 
+    logInfo(s"[along]eam_schedule: now=$now")
+
     updateAndSyncNumExecutorsTarget(now)
 
     val executorIdsToBeRemoved = ArrayBuffer[String]()
     removeTimes.retain { case (executorId, expireTime) =>
       val expired = now >= expireTime
+      logInfo(s"[along]eam_schedule: executorId=$executorId, expireTime=$expireTime.")
       if (expired) {
+        logInfo(s"[along]eam_schedule: executor $executorId is to be removed.")
         initializing = false
         executorIdsToBeRemoved += executorId
       }
       !expired
     }
     if (executorIdsToBeRemoved.nonEmpty) {
+      logInfo(s"[along]eam_schedule: need to remove some execotors.")
       removeExecutors(executorIdsToBeRemoved)
     }
+
+    logInfo(s"[along]eam_schedule: no need to remove some execotors.")
   }
 
   /**
