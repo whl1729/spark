@@ -52,7 +52,7 @@ class LocalSparkCluster(
     // Disable REST server on Master in this mode unless otherwise specified
     val _conf = conf.clone()
       .setIfMissing("spark.master.rest.enabled", "false")
-      .set("spark.shuffle.service.enabled", "false")
+      .set("spark.shuffle.service.enabled", "true")
 
     /* Start the Master */
     val (rpcEnv, webUiPort, _) = Master.startRpcEnvAndEndpoint(localHostname, 0, 0, _conf)

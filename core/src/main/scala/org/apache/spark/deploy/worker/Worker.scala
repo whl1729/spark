@@ -759,7 +759,7 @@ private[deploy] object Worker extends Logging {
     // bound, we may launch no more than one external shuffle service on each host.
     // When this happens, we should give explicit reason of failure instead of fail silently. For
     // more detail see SPARK-20989.
-    val externalShuffleServiceEnabled = conf.getBoolean("spark.shuffle.service.enabled", false)
+    val externalShuffleServiceEnabled = conf.getBoolean("spark.shuffle.service.enabled", true)
     val sparkWorkerInstances = scala.sys.env.getOrElse("SPARK_WORKER_INSTANCES", "1").toInt
     require(externalShuffleServiceEnabled == false || sparkWorkerInstances <= 1,
       "Starting multiple workers on one host is failed because we may launch no more than one " +
