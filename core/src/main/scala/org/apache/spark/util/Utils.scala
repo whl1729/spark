@@ -2551,7 +2551,13 @@ private[spark] object Utils extends Logging {
    * Return whether dynamic allocation is enabled in the given conf.
    */
   def isDynamicAllocationEnabled(conf: SparkConf): Boolean = {
-    val dynamicAllocationEnabled = conf.getBoolean("spark.dynamicAllocation.enabled", false)
+    val dynamicAllocationEnabled = conf.getBoolean("spark.dynamicAllocation.enabled", true)
+    if (dynamicAllocationEnabled) {
+      logInfo("[along]sc: dynamicAllocation is Enabled.")
+    } else {
+      logInfo("[along]sc: dynamicAllocation isn't Enabled.")
+    }
+
     dynamicAllocationEnabled &&
       (!isLocalMaster(conf) || conf.getBoolean("spark.dynamicAllocation.testing", false))
   }

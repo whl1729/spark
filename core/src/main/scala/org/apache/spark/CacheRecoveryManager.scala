@@ -64,6 +64,7 @@ private class CacheRecoveryManager(
 
     canBeRecovered.flatMap { execIds =>
       execIds.foreach { execId => recoveringExecutors.put(execId, execId) }
+      execIds.foreach { execId => logInfo(s"[along]crm_startCacheRecovery: executor $execId can be recovered.") }
       Future.sequence(execIds.map { replicateUntilTimeoutThenKill })
     }
   }
