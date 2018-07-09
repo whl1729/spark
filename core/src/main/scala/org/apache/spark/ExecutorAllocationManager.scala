@@ -131,7 +131,9 @@ private[spark] class ExecutorAllocationManager(
 
   // The desired number of executors at this moment in time. If all our executors were to die, this
   // is the number of executors we would immediately want from the cluster manager.
-  private var numExecutorsTarget = initialNumExecutors
+  //private var numExecutorsTarget = initialNumExecutors
+  // along: increase the vlaue of numExecutorsTarget
+  private var numExecutorsTarget = 5
 
   // Executors that have been requested to be removed but have not been killed yet
   private val executorsPendingToRemove = new mutable.HashSet[String]
@@ -179,6 +181,9 @@ private[spark] class ExecutorAllocationManager(
 
   // Host to possible task running on it, used for executor placement.
   private var hostToLocalTaskCount: Map[String, Int] = Map.empty
+
+  // along: Record time so as to decide when to kill an executor
+  private var lastTime = 0
 
   /**
    * Verify that the settings specified through the config are valid.
@@ -309,11 +314,19 @@ private[spark] class ExecutorAllocationManager(
   private def schedule(): Unit = synchronized {
     val now = clock.getTimeMillis
 
-    logInfo(s"[along]eam_schedule: now=$now")
-
-    updateAndSyncNumExecutorsTarget(now)
-
     val executorIdsToBeRemoved = ArrayBuffer[String]()
+
+    if (now - lastTime >= 10000) {
+      logInfo(s"[along]now is time to kill one executor among ")
+      executorIds.foreach { executor => 
+        logInfo(s"executor[$executorId] ")
+      }
+
+      executorIdsToBeRemoved += executorIds.min
+
+      lastTime = now
+    }
+
     removeTimes.retain { case (executorId, expireTime) =>
       val expired = now >= expireTime
       logInfo(s"[along]eam_schedule: executorId=$executorId, expireTime=$expireTime.")
@@ -324,12 +337,11 @@ private[spark] class ExecutorAllocationManager(
       }
       !expired
     }
+
     if (executorIdsToBeRemoved.nonEmpty) {
       logInfo(s"[along]eam_schedule: need to remove some execotors.")
       removeExecutors(executorIdsToBeRemoved)
     }
-
-    logInfo(s"[along]eam_schedule: no need to remove some execotors.")
   }
 
   /**
