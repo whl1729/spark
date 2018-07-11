@@ -703,13 +703,16 @@ private[spark] class ExecutorAllocationManager(
         if ((stageId == 15) || (stageId == 21)) {
           logInfo(s"[along]onStageCompleted: stageId=$stageId.")
           if (executorIds.size > 1) {
-            logInfo(s"[along]we're going to kill executor $(executorIds.min) among executor ")
+            val minExec = executorIds.min
+            logInfo(s"[along]we're going to kill executor $minExec among executor ")
             
-            executorIds.foreach { executor => 
+            executorIds.foreach { executorId => 
               logInfo(s"$executorId ")
             }
 
-            executorIdsToBeRemoved += executorIds.min
+            val executorIdsToBeRemoved = ArrayBuffer[String]()
+            executorIdsToBeRemoved += minExec
+            removeExecutors(executorIdsToBeRemoved)
           }
         }
 
