@@ -131,9 +131,7 @@ private[spark] class ExecutorAllocationManager(
 
   // The desired number of executors at this moment in time. If all our executors were to die, this
   // is the number of executors we would immediately want from the cluster manager.
-  //private var numExecutorsTarget = initialNumExecutors
-  // along: increase the vlaue of numExecutorsTarget
-  private var numExecutorsTarget = 5
+  private var numExecutorsTarget = initialNumExecutors
 
   // Executors that have been requested to be removed but have not been killed yet
   private val executorsPendingToRemove = new mutable.HashSet[String]
