@@ -182,9 +182,6 @@ private[spark] class ExecutorAllocationManager(
   // Host to possible task running on it, used for executor placement.
   private var hostToLocalTaskCount: Map[String, Int] = Map.empty
 
-  // along: Record time so as to decide when to kill an executor
-  private var lastTime = 0
-
   /**
    * Verify that the settings specified through the config are valid.
    * If not, throw an appropriate exception.
@@ -315,17 +312,6 @@ private[spark] class ExecutorAllocationManager(
     val now = clock.getTimeMillis
 
     val executorIdsToBeRemoved = ArrayBuffer[String]()
-
-    if (now - lastTime >= 10000) {
-      logInfo(s"[along]now is time to kill one executor among ")
-      executorIds.foreach { executor => 
-        logInfo(s"executor[$executorId] ")
-      }
-
-      executorIdsToBeRemoved += executorIds.min
-
-      lastTime = now
-    }
 
     removeTimes.retain { case (executorId, expireTime) =>
       val expired = now >= expireTime
@@ -713,6 +699,20 @@ private[spark] class ExecutorAllocationManager(
         if (stageIdToNumTasks.isEmpty && stageIdToNumSpeculativeTasks.isEmpty) {
           allocationManager.onSchedulerQueueEmpty()
         }
+
+        if ((stageId == 15) || (stageId == 21)) {
+          logInfo(s"[along]onStageCompleted: stageId=$stageId.")
+          if (executorIds.size > 1) {
+            logInfo(s"[along]we're going to kill executor $(executorIds.min) among executor ")
+            
+            executorIds.foreach { executor => 
+              logInfo(s"$executorId ")
+            }
+
+            executorIdsToBeRemoved += executorIds.min
+          }
+        }
+
       }
     }
 
