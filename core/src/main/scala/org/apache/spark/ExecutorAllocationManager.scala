@@ -313,7 +313,6 @@ private[spark] class ExecutorAllocationManager(
 
     removeTimes.retain { case (executorId, expireTime) =>
       val expired = now >= expireTime
-      logInfo(s"[along]eam_schedule: executorId=$executorId, expireTime=$expireTime.")
       if (expired) {
         logInfo(s"[along]eam_schedule: executor $executorId is to be removed.")
         initializing = false
@@ -465,7 +464,11 @@ private[spark] class ExecutorAllocationManager(
       .filter(canBeKilled)
       .splitAt(numExistingExecs - execCountFloor)
 
-    if (log.isDebugEnabled()) {
+    logInfo(s"[along]removeExecutors: numExistingExecs=$numExistingExecs, execCountFloor=$execCountFloor, " +
+      s"minNumExecutors=$minNumExecutors, numExecutorsTarget=$numExecutorsTarget.")
+
+    // if (log.isDebugEnabled()) {
+    if (!executors.isEmpty) {
       dontRemove.foreach { execId =>
         logDebug(s"Not removing idle executor $execId because it " +
           s"would put us below the minimum limit of $minNumExecutors executors" +
@@ -474,14 +477,18 @@ private[spark] class ExecutorAllocationManager(
     }
 
     if (executorIdsToBeRemoved.isEmpty) {
+      logInfo(s"[along]removeExecutors: executorIdsToBeRemoved is empty.")
       Seq.empty[String]
     } else if (testing) {
+      logInfo(s"[along]removeExecutors: testing.")
       recordExecutorKill(executorIdsToBeRemoved)
     } else if (recoverCachedData) {
+      logInfo(s"[along]removeExecutors: recoverCachedData.")
       client.markPendingToRemove(executorIdsToBeRemoved)
       recordExecutorKill(executorIdsToBeRemoved)
       cacheRecoveryManager.startCacheRecovery(executorIdsToBeRemoved)
     } else {
+      logInfo(s"[along]removeExecutors: else.")
       val killed = killExecutors(executorIdsToBeRemoved)
       recordExecutorKill(killed)
     }

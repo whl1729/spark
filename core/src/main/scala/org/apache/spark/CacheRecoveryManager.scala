@@ -59,12 +59,12 @@ private class CacheRecoveryManager(
    * @return a sequence of futures of Unit that will complete once the executor has been killed.
    */
   def startCacheRecovery(execIds: Seq[String]): Future[Seq[KillReason]] = {
-    logDebug(s"Recover cached data before shutting down executors ${execIds.mkString(", ")}.")
+    logDebug(s"[along]startCacheRecovery: Recover cached data before shutting down executors ${execIds.mkString(", ")}.")
     val canBeRecovered: Future[Seq[String]] = checkMem(execIds)
 
     canBeRecovered.flatMap { execIds =>
       execIds.foreach { execId => recoveringExecutors.put(execId, execId) }
-      execIds.foreach { execId => logInfo(s"[along]crm_startCacheRecovery: executor $execId can be recovered.") }
+      execIds.foreach { execId => logInfo(s"[along]startCacheRecovery: executor $execId can be recovered.") }
       Future.sequence(execIds.map { replicateUntilTimeoutThenKill })
     }
   }
