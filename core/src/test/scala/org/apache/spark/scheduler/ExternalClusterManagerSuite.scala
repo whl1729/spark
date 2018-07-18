@@ -89,5 +89,6 @@ private class DummyTaskScheduler extends TaskScheduler {
   def executorHeartbeatReceived(
       execId: String,
       accumUpdates: Array[(Long, Seq[AccumulatorV2[_, _]])],
-      blockManagerId: BlockManagerId): Boolean = true
+      blockManagerId: BlockManagerId,
+      executorMetrics: Array[Long]): Boolean = true
 }

@@ -17,1168 +17,967 @@
 
 package org.apache.spark.status
 
-import java.io.File
-import java.lang.{Integer => JInteger, Long => JLong}
-import java.util.{Arrays, Date, Properties}
+import java.util.Date
+import java.util.concurrent.ConcurrentHashMap
+import java.util.function.Function
 
 import scala.collection.JavaConverters._
-import scala.reflect.{classTag, ClassTag}
-
-import org.scalatest.BeforeAndAfter
+import scala.collection.mutable.HashMap
 
 import org.apache.spark._
 import org.apache.spark.executor.TaskMetrics
+import org.apache.spark.internal.Logging
 import org.apache.spark.scheduler._
-import org.apache.spark.scheduler.cluster._
 import org.apache.spark.status.api.v1
 import org.apache.spark.storage._
-import org.apache.spark.util.Utils
-import org.apache.spark.util.kvstore._
+import org.apache.spark.ui.SparkUI
+import org.apache.spark.ui.scope._
 
-class AppStatusListenerSuite extends SparkFunSuite with BeforeAndAfter {
+/**
+ * A Spark listener that writes application information to a data store. The types written to the
+ * store are defined in the `storeTypes.scala` file and are based on the public REST API.
+ *
+ * @param lastUpdateTime When replaying logs, the log's last update time, so that the duration of
+ *                       unfinished tasks can be more accurately calculated (see SPARK-21922).
+ */
+private[spark] class AppStatusListener(
+    kvstore: ElementTrackingStore,
+    conf: SparkConf,
+    live: Boolean,
+    lastUpdateTime: Option[Long] = None) extends SparkListener with Logging {
 
   import config._
 
-  private val conf = new SparkConf()
-    .set(LIVE_ENTITY_UPDATE_PERIOD, 0L)
-    .set(ASYNC_TRACKING_ENABLED, false)
+  private var sparkVersion = SPARK_VERSION
+  private var appInfo: v1.ApplicationInfo = null
+  private var appSummary = new AppSummary(0, 0)
+  private var coresPerTask: Int = 1
 
-  private var time: Long = _
-  private var testDir: File = _
-  private var store: ElementTrackingStore = _
-  private var taskIdTracker = -1L
+  // How often to update live entities. -1 means "never update" when replaying applications,
+  // meaning only the last write will happen. For live applications, this avoids a few
+  // operations that we can live without when rapidly processing incoming task events.
+  private val liveUpdatePeriodNs = if (live) conf.get(LIVE_ENTITY_UPDATE_PERIOD) else -1L
 
-  before {
-    time = 0L
-    testDir = Utils.createTempDir()
-    store = new ElementTrackingStore(KVUtils.open(testDir, getClass().getName()), conf)
-    taskIdTracker = -1L
+  private val maxTasksPerStage = conf.get(MAX_RETAINED_TASKS_PER_STAGE)
+  private val maxGraphRootNodes = conf.get(MAX_RETAINED_ROOT_NODES)
+
+  // Keep track of live entities, so that task metrics can be efficiently updated (without
+  // causing too many writes to the underlying store, and other expensive operations).
+  private val liveStages = new ConcurrentHashMap[(Int, Int), LiveStage]()
+  private val liveJobs = new HashMap[Int, LiveJob]()
+  private val liveExecutors = new HashMap[String, LiveExecutor]()
+  private val liveTasks = new HashMap[Long, LiveTask]()
+  private val liveRDDs = new HashMap[Int, LiveRDD]()
+  private val pools = new HashMap[String, SchedulerPool]()
+  // Keep the active executor count as a separate variable to avoid having to do synchronization
+  // around liveExecutors.
+  @volatile private var activeExecutorCount = 0
+
+  kvstore.addTrigger(classOf[ExecutorSummaryWrapper], conf.get(MAX_RETAINED_DEAD_EXECUTORS))
+    { count => cleanupExecutors(count) }
+
+  kvstore.addTrigger(classOf[JobDataWrapper], conf.get(MAX_RETAINED_JOBS)) { count =>
+    cleanupJobs(count)
   }
 
-  after {
-    store.close()
-    Utils.deleteRecursively(testDir)
+  kvstore.addTrigger(classOf[StageDataWrapper], conf.get(MAX_RETAINED_STAGES)) { count =>
+    cleanupStages(count)
   }
 
-  test("environment info") {
-    val listener = new AppStatusListener(store, conf, true)
-
-    val details = Map(
-      "JVM Information" -> Seq(
-        "Java Version" -> sys.props("java.version"),
-        "Java Home" -> sys.props("java.home"),
-        "Scala Version" -> scala.util.Properties.versionString
-      ),
-      "Spark Properties" -> Seq(
-        "spark.conf.1" -> "1",
-        "spark.conf.2" -> "2"
-      ),
-      "System Properties" -> Seq(
-        "sys.prop.1" -> "1",
-        "sys.prop.2" -> "2"
-      ),
-      "Classpath Entries" -> Seq(
-        "/jar1" -> "System",
-        "/jar2" -> "User"
-      )
-    )
-
-    listener.onEnvironmentUpdate(SparkListenerEnvironmentUpdate(details))
-
-    val appEnvKey = classOf[ApplicationEnvironmentInfoWrapper].getName()
-    check[ApplicationEnvironmentInfoWrapper](appEnvKey) { env =>
-      val info = env.info
-
-      val runtimeInfo = Map(details("JVM Information"): _*)
-      assert(info.runtime.javaVersion == runtimeInfo("Java Version"))
-      assert(info.runtime.javaHome == runtimeInfo("Java Home"))
-      assert(info.runtime.scalaVersion == runtimeInfo("Scala Version"))
-
-      assert(info.sparkProperties === details("Spark Properties"))
-      assert(info.systemProperties === details("System Properties"))
-      assert(info.classpathEntries === details("Classpath Entries"))
+  kvstore.onFlush {
+    if (!live) {
+      flush()
     }
   }
 
-  test("scheduler events") {
-    val listener = new AppStatusListener(store, conf, true)
+  override def onOtherEvent(event: SparkListenerEvent): Unit = event match {
+    case SparkListenerLogStart(version) => sparkVersion = version
+    case _ =>
+  }
 
-    listener.onOtherEvent(SparkListenerLogStart("TestSparkVersion"))
+  override def onApplicationStart(event: SparkListenerApplicationStart): Unit = {
+    assert(event.appId.isDefined, "Application without IDs are not supported.")
 
-    // Start the application.
-    time += 1
-    listener.onApplicationStart(SparkListenerApplicationStart(
-      "name",
-      Some("id"),
-      time,
-      "user",
-      Some("attempt"),
-      None))
+    val attempt = v1.ApplicationAttemptInfo(
+      event.appAttemptId,
+      new Date(event.time),
+      new Date(-1),
+      new Date(event.time),
+      -1L,
+      event.sparkUser,
+      false,
+      sparkVersion)
 
-    check[ApplicationInfoWrapper]("id") { app =>
-      assert(app.info.name === "name")
-      assert(app.info.id === "id")
-      assert(app.info.attempts.size === 1)
+    appInfo = v1.ApplicationInfo(
+      event.appId.get,
+      event.appName,
+      None,
+      None,
+      None,
+      None,
+      Seq(attempt))
 
-      val attempt = app.info.attempts.head
-      assert(attempt.attemptId === Some("attempt"))
-      assert(attempt.startTime === new Date(time))
-      assert(attempt.lastUpdated === new Date(time))
-      assert(attempt.endTime.getTime() === -1L)
-      assert(attempt.sparkUser === "user")
-      assert(!attempt.completed)
-      assert(attempt.appSparkVersion === "TestSparkVersion")
-    }
+    kvstore.write(new ApplicationInfoWrapper(appInfo))
+    kvstore.write(appSummary)
 
-    // Start a couple of executors.
-    time += 1
-    val execIds = Array("1", "2")
-
-    execIds.foreach { id =>
-      listener.onExecutorAdded(SparkListenerExecutorAdded(time, id,
-        new ExecutorInfo(s"$id.example.com", 1, Map())))
-    }
-
-    execIds.foreach { id =>
-      check[ExecutorSummaryWrapper](id) { exec =>
-        assert(exec.info.id === id)
-        assert(exec.info.hostPort === s"$id.example.com")
-        assert(exec.info.isActive)
+    // Update the driver block manager with logs from this event. The SparkContext initialization
+    // code registers the driver before this event is sent.
+    event.driverLogs.foreach { logs =>
+      val driver = liveExecutors.get(SparkContext.DRIVER_IDENTIFIER)
+        .orElse(liveExecutors.get(SparkContext.LEGACY_DRIVER_IDENTIFIER))
+      driver.foreach { d =>
+        d.executorLogs = logs.toMap
+        update(d, System.nanoTime())
       }
-    }
-
-    // Start a job with 2 stages / 4 tasks each
-    time += 1
-    val stages = Seq(
-      new StageInfo(1, 0, "stage1", 4, Nil, Nil, "details1"),
-      new StageInfo(2, 0, "stage2", 4, Nil, Seq(1), "details2"))
-
-    val jobProps = new Properties()
-    jobProps.setProperty(SparkContext.SPARK_JOB_GROUP_ID, "jobGroup")
-    jobProps.setProperty("spark.scheduler.pool", "schedPool")
-
-    listener.onJobStart(SparkListenerJobStart(1, time, stages, jobProps))
-
-    check[JobDataWrapper](1) { job =>
-      assert(job.info.jobId === 1)
-      assert(job.info.name === stages.last.name)
-      assert(job.info.description === None)
-      assert(job.info.status === JobExecutionStatus.RUNNING)
-      assert(job.info.submissionTime === Some(new Date(time)))
-      assert(job.info.jobGroup === Some("jobGroup"))
-    }
-
-    stages.foreach { info =>
-      check[StageDataWrapper](key(info)) { stage =>
-        assert(stage.info.status === v1.StageStatus.PENDING)
-        assert(stage.jobIds === Set(1))
-      }
-    }
-
-    // Submit stage 1
-    time += 1
-    stages.head.submissionTime = Some(time)
-    listener.onStageSubmitted(SparkListenerStageSubmitted(stages.head, jobProps))
-
-    check[JobDataWrapper](1) { job =>
-      assert(job.info.numActiveStages === 1)
-    }
-
-    check[StageDataWrapper](key(stages.head)) { stage =>
-      assert(stage.info.status === v1.StageStatus.ACTIVE)
-      assert(stage.info.submissionTime === Some(new Date(stages.head.submissionTime.get)))
-      assert(stage.info.numTasks === stages.head.numTasks)
-    }
-
-    // Start tasks from stage 1
-    time += 1
-
-    val s1Tasks = createTasks(4, execIds)
-    s1Tasks.foreach { task =>
-      listener.onTaskStart(SparkListenerTaskStart(stages.head.stageId,
-        stages.head.attemptNumber,
-        task))
-    }
-
-    assert(store.count(classOf[TaskDataWrapper]) === s1Tasks.size)
-
-    check[JobDataWrapper](1) { job =>
-      assert(job.info.numActiveTasks === s1Tasks.size)
-    }
-
-    check[StageDataWrapper](key(stages.head)) { stage =>
-      assert(stage.info.numActiveTasks === s1Tasks.size)
-      assert(stage.info.firstTaskLaunchedTime === Some(new Date(s1Tasks.head.launchTime)))
-    }
-
-    s1Tasks.foreach { task =>
-      check[TaskDataWrapper](task.taskId) { wrapper =>
-        assert(wrapper.taskId === task.taskId)
-        assert(wrapper.stageId === stages.head.stageId)
-        assert(wrapper.stageAttemptId === stages.head.attemptId)
-        assert(wrapper.index === task.index)
-        assert(wrapper.attempt === task.attemptNumber)
-        assert(wrapper.launchTime === task.launchTime)
-        assert(wrapper.executorId === task.executorId)
-        assert(wrapper.host === task.host)
-        assert(wrapper.status === task.status)
-        assert(wrapper.taskLocality === task.taskLocality.toString())
-        assert(wrapper.speculative === task.speculative)
-      }
-    }
-
-    // Send two executor metrics update. Only update one metric to avoid a lot of boilerplate code.
-    // The tasks are distributed among the two executors, so the executor-level metrics should
-    // hold half of the cummulative value of the metric being updated.
-    Seq(1L, 2L).foreach { value =>
-      s1Tasks.foreach { task =>
-        val accum = new AccumulableInfo(1L, Some(InternalAccumulator.MEMORY_BYTES_SPILLED),
-          Some(value), None, true, false, None)
-        listener.onExecutorMetricsUpdate(SparkListenerExecutorMetricsUpdate(
-          task.executorId,
-          Seq((task.taskId, stages.head.stageId, stages.head.attemptNumber, Seq(accum)))))
-      }
-
-      check[StageDataWrapper](key(stages.head)) { stage =>
-        assert(stage.info.memoryBytesSpilled === s1Tasks.size * value)
-      }
-
-      val execs = store.view(classOf[ExecutorStageSummaryWrapper]).index("stage")
-        .first(key(stages.head)).last(key(stages.head)).asScala.toSeq
-      assert(execs.size > 0)
-      execs.foreach { exec =>
-        assert(exec.info.memoryBytesSpilled === s1Tasks.size * value / 2)
-      }
-    }
-
-    // Fail one of the tasks, re-start it.
-    time += 1
-    s1Tasks.head.markFinished(TaskState.FAILED, time)
-    listener.onTaskEnd(SparkListenerTaskEnd(stages.head.stageId, stages.head.attemptNumber,
-      "taskType", TaskResultLost, s1Tasks.head, null))
-
-    time += 1
-    val reattempt = newAttempt(s1Tasks.head, nextTaskId())
-    listener.onTaskStart(SparkListenerTaskStart(stages.head.stageId, stages.head.attemptNumber,
-      reattempt))
-
-    assert(store.count(classOf[TaskDataWrapper]) === s1Tasks.size + 1)
-
-    check[JobDataWrapper](1) { job =>
-      assert(job.info.numFailedTasks === 1)
-      assert(job.info.numActiveTasks === s1Tasks.size)
-    }
-
-    check[StageDataWrapper](key(stages.head)) { stage =>
-      assert(stage.info.numFailedTasks === 1)
-      assert(stage.info.numActiveTasks === s1Tasks.size)
-    }
-
-    check[TaskDataWrapper](s1Tasks.head.taskId) { task =>
-      assert(task.status === s1Tasks.head.status)
-      assert(task.errorMessage == Some(TaskResultLost.toErrorString))
-    }
-
-    check[TaskDataWrapper](reattempt.taskId) { task =>
-      assert(task.index === s1Tasks.head.index)
-      assert(task.attempt === reattempt.attemptNumber)
-    }
-
-    // Kill one task, restart it.
-    time += 1
-    val killed = s1Tasks.drop(1).head
-    killed.finishTime = time
-    killed.failed = true
-    listener.onTaskEnd(SparkListenerTaskEnd(stages.head.stageId, stages.head.attemptNumber,
-      "taskType", TaskKilled("killed"), killed, null))
-
-    check[JobDataWrapper](1) { job =>
-      assert(job.info.numKilledTasks === 1)
-      assert(job.info.killedTasksSummary === Map("killed" -> 1))
-    }
-
-    check[StageDataWrapper](key(stages.head)) { stage =>
-      assert(stage.info.numKilledTasks === 1)
-      assert(stage.info.killedTasksSummary === Map("killed" -> 1))
-    }
-
-    check[TaskDataWrapper](killed.taskId) { task =>
-      assert(task.index === killed.index)
-      assert(task.errorMessage === Some("killed"))
-    }
-
-    // Start a new attempt and finish it with TaskCommitDenied, make sure it's handled like a kill.
-    time += 1
-    val denied = newAttempt(killed, nextTaskId())
-    val denyReason = TaskCommitDenied(1, 1, 1)
-    listener.onTaskStart(SparkListenerTaskStart(stages.head.stageId, stages.head.attemptNumber,
-      denied))
-
-    time += 1
-    denied.finishTime = time
-    denied.failed = true
-    listener.onTaskEnd(SparkListenerTaskEnd(stages.head.stageId, stages.head.attemptNumber,
-      "taskType", denyReason, denied, null))
-
-    check[JobDataWrapper](1) { job =>
-      assert(job.info.numKilledTasks === 2)
-      assert(job.info.killedTasksSummary === Map("killed" -> 1, denyReason.toErrorString -> 1))
-    }
-
-    check[StageDataWrapper](key(stages.head)) { stage =>
-      assert(stage.info.numKilledTasks === 2)
-      assert(stage.info.killedTasksSummary === Map("killed" -> 1, denyReason.toErrorString -> 1))
-    }
-
-    check[TaskDataWrapper](denied.taskId) { task =>
-      assert(task.index === killed.index)
-      assert(task.errorMessage === Some(denyReason.toErrorString))
-    }
-
-    // Start a new attempt.
-    val reattempt2 = newAttempt(denied, nextTaskId())
-    listener.onTaskStart(SparkListenerTaskStart(stages.head.stageId, stages.head.attemptNumber,
-      reattempt2))
-
-    // Succeed all tasks in stage 1.
-    val pending = s1Tasks.drop(2) ++ Seq(reattempt, reattempt2)
-
-    val s1Metrics = TaskMetrics.empty
-    s1Metrics.setExecutorCpuTime(2L)
-    s1Metrics.setExecutorRunTime(4L)
-
-    time += 1
-    pending.foreach { task =>
-      task.markFinished(TaskState.FINISHED, time)
-      listener.onTaskEnd(SparkListenerTaskEnd(stages.head.stageId, stages.head.attemptNumber,
-        "taskType", Success, task, s1Metrics))
-    }
-
-    check[JobDataWrapper](1) { job =>
-      assert(job.info.numFailedTasks === 1)
-      assert(job.info.numKilledTasks === 2)
-      assert(job.info.numActiveTasks === 0)
-      assert(job.info.numCompletedTasks === pending.size)
-    }
-
-    check[StageDataWrapper](key(stages.head)) { stage =>
-      assert(stage.info.numFailedTasks === 1)
-      assert(stage.info.numKilledTasks === 2)
-      assert(stage.info.numActiveTasks === 0)
-      assert(stage.info.numCompleteTasks === pending.size)
-    }
-
-    pending.foreach { task =>
-      check[TaskDataWrapper](task.taskId) { wrapper =>
-        assert(wrapper.errorMessage === None)
-        assert(wrapper.executorCpuTime === 2L)
-        assert(wrapper.executorRunTime === 4L)
-        assert(wrapper.duration === task.duration)
-      }
-    }
-
-    assert(store.count(classOf[TaskDataWrapper]) === pending.size + 3)
-
-    // End stage 1.
-    time += 1
-    stages.head.completionTime = Some(time)
-    listener.onStageCompleted(SparkListenerStageCompleted(stages.head))
-
-    check[JobDataWrapper](1) { job =>
-      assert(job.info.numActiveStages === 0)
-      assert(job.info.numCompletedStages === 1)
-    }
-
-    check[StageDataWrapper](key(stages.head)) { stage =>
-      assert(stage.info.status === v1.StageStatus.COMPLETE)
-      assert(stage.info.numFailedTasks === 1)
-      assert(stage.info.numActiveTasks === 0)
-      assert(stage.info.numCompleteTasks === pending.size)
-    }
-
-    // Submit stage 2.
-    time += 1
-    stages.last.submissionTime = Some(time)
-    listener.onStageSubmitted(SparkListenerStageSubmitted(stages.last, jobProps))
-
-    check[JobDataWrapper](1) { job =>
-      assert(job.info.numActiveStages === 1)
-    }
-
-    check[StageDataWrapper](key(stages.last)) { stage =>
-      assert(stage.info.status === v1.StageStatus.ACTIVE)
-      assert(stage.info.submissionTime === Some(new Date(stages.last.submissionTime.get)))
-    }
-
-    // Start and fail all tasks of stage 2.
-    time += 1
-    val s2Tasks = createTasks(4, execIds)
-    s2Tasks.foreach { task =>
-      listener.onTaskStart(SparkListenerTaskStart(stages.last.stageId,
-        stages.last.attemptNumber,
-        task))
-    }
-
-    time += 1
-    s2Tasks.foreach { task =>
-      task.markFinished(TaskState.FAILED, time)
-      listener.onTaskEnd(SparkListenerTaskEnd(stages.last.stageId, stages.last.attemptNumber,
-        "taskType", TaskResultLost, task, null))
-    }
-
-    check[JobDataWrapper](1) { job =>
-      assert(job.info.numFailedTasks === 1 + s2Tasks.size)
-      assert(job.info.numActiveTasks === 0)
-    }
-
-    check[StageDataWrapper](key(stages.last)) { stage =>
-      assert(stage.info.numFailedTasks === s2Tasks.size)
-      assert(stage.info.numActiveTasks === 0)
-    }
-
-    // Fail stage 2.
-    time += 1
-    stages.last.completionTime = Some(time)
-    stages.last.failureReason = Some("uh oh")
-    listener.onStageCompleted(SparkListenerStageCompleted(stages.last))
-
-    check[JobDataWrapper](1) { job =>
-      assert(job.info.numCompletedStages === 1)
-      assert(job.info.numFailedStages === 1)
-    }
-
-    check[StageDataWrapper](key(stages.last)) { stage =>
-      assert(stage.info.status === v1.StageStatus.FAILED)
-      assert(stage.info.numFailedTasks === s2Tasks.size)
-      assert(stage.info.numActiveTasks === 0)
-      assert(stage.info.numCompleteTasks === 0)
-      assert(stage.info.failureReason === stages.last.failureReason)
-    }
-
-    // - Re-submit stage 2, all tasks, and succeed them and the stage.
-    val oldS2 = stages.last
-    val newS2 = new StageInfo(oldS2.stageId, oldS2.attemptNumber + 1, oldS2.name, oldS2.numTasks,
-      oldS2.rddInfos, oldS2.parentIds, oldS2.details, oldS2.taskMetrics)
-
-    time += 1
-    newS2.submissionTime = Some(time)
-    listener.onStageSubmitted(SparkListenerStageSubmitted(newS2, jobProps))
-    assert(store.count(classOf[StageDataWrapper]) === 3)
-
-    val newS2Tasks = createTasks(4, execIds)
-
-    newS2Tasks.foreach { task =>
-      listener.onTaskStart(SparkListenerTaskStart(newS2.stageId, newS2.attemptNumber, task))
-    }
-
-    time += 1
-    newS2Tasks.foreach { task =>
-      task.markFinished(TaskState.FINISHED, time)
-      listener.onTaskEnd(SparkListenerTaskEnd(newS2.stageId, newS2.attemptNumber, "taskType",
-        Success, task, null))
-    }
-
-    time += 1
-    newS2.completionTime = Some(time)
-    listener.onStageCompleted(SparkListenerStageCompleted(newS2))
-
-    check[JobDataWrapper](1) { job =>
-      assert(job.info.numActiveStages === 0)
-      assert(job.info.numFailedStages === 1)
-      assert(job.info.numCompletedStages === 2)
-    }
-
-    check[StageDataWrapper](key(newS2)) { stage =>
-      assert(stage.info.status === v1.StageStatus.COMPLETE)
-      assert(stage.info.numActiveTasks === 0)
-      assert(stage.info.numCompleteTasks === newS2Tasks.size)
-    }
-
-    // End job.
-    time += 1
-    listener.onJobEnd(SparkListenerJobEnd(1, time, JobSucceeded))
-
-    check[JobDataWrapper](1) { job =>
-      assert(job.info.status === JobExecutionStatus.SUCCEEDED)
-    }
-
-    // Submit a second job that re-uses stage 1 and stage 2. Stage 1 won't be re-run, but
-    // stage 2 will. In any case, the DAGScheduler creates new info structures that are copies
-    // of the old stages, so mimic that behavior here. The "new" stage 1 is submitted without
-    // a submission time, which means it is "skipped", and the stage 2 re-execution should not
-    // change the stats of the already finished job.
-    time += 1
-    val j2Stages = Seq(
-      new StageInfo(3, 0, "stage1", 4, Nil, Nil, "details1"),
-      new StageInfo(4, 0, "stage2", 4, Nil, Seq(3), "details2"))
-    j2Stages.last.submissionTime = Some(time)
-    listener.onJobStart(SparkListenerJobStart(2, time, j2Stages, null))
-    assert(store.count(classOf[JobDataWrapper]) === 2)
-
-    listener.onStageSubmitted(SparkListenerStageSubmitted(j2Stages.head, jobProps))
-    listener.onStageCompleted(SparkListenerStageCompleted(j2Stages.head))
-    listener.onStageSubmitted(SparkListenerStageSubmitted(j2Stages.last, jobProps))
-    assert(store.count(classOf[StageDataWrapper]) === 5)
-
-    time += 1
-    val j2s2Tasks = createTasks(4, execIds)
-
-    j2s2Tasks.foreach { task =>
-      listener.onTaskStart(SparkListenerTaskStart(j2Stages.last.stageId,
-        j2Stages.last.attemptNumber,
-        task))
-    }
-
-    time += 1
-    j2s2Tasks.foreach { task =>
-      task.markFinished(TaskState.FINISHED, time)
-      listener.onTaskEnd(SparkListenerTaskEnd(j2Stages.last.stageId, j2Stages.last.attemptNumber,
-        "taskType", Success, task, null))
-    }
-
-    time += 1
-    j2Stages.last.completionTime = Some(time)
-    listener.onStageCompleted(SparkListenerStageCompleted(j2Stages.last))
-
-    time += 1
-    listener.onJobEnd(SparkListenerJobEnd(2, time, JobSucceeded))
-
-    check[JobDataWrapper](1) { job =>
-      assert(job.info.numCompletedStages === 2)
-      assert(job.info.numCompletedTasks === s1Tasks.size + s2Tasks.size)
-    }
-
-    check[JobDataWrapper](2) { job =>
-      assert(job.info.status === JobExecutionStatus.SUCCEEDED)
-      assert(job.info.numCompletedStages === 1)
-      assert(job.info.numCompletedTasks === j2s2Tasks.size)
-      assert(job.info.numSkippedStages === 1)
-      assert(job.info.numSkippedTasks === s1Tasks.size)
-    }
-
-    // Blacklist an executor.
-    time += 1
-    listener.onExecutorBlacklisted(SparkListenerExecutorBlacklisted(time, "1", 42))
-    check[ExecutorSummaryWrapper]("1") { exec =>
-      assert(exec.info.isBlacklisted)
-    }
-
-    time += 1
-    listener.onExecutorUnblacklisted(SparkListenerExecutorUnblacklisted(time, "1"))
-    check[ExecutorSummaryWrapper]("1") { exec =>
-      assert(!exec.info.isBlacklisted)
-    }
-
-    // Blacklist a node.
-    time += 1
-    listener.onNodeBlacklisted(SparkListenerNodeBlacklisted(time, "1.example.com", 2))
-    check[ExecutorSummaryWrapper]("1") { exec =>
-      assert(exec.info.isBlacklisted)
-    }
-
-    time += 1
-    listener.onNodeUnblacklisted(SparkListenerNodeUnblacklisted(time, "1.example.com"))
-    check[ExecutorSummaryWrapper]("1") { exec =>
-      assert(!exec.info.isBlacklisted)
-    }
-
-    // Stop executors.
-    time += 1
-    listener.onExecutorRemoved(SparkListenerExecutorRemoved(time, "1", "Test"))
-    listener.onExecutorRemoved(SparkListenerExecutorRemoved(time, "2", "Test"))
-
-    Seq("1", "2").foreach { id =>
-      check[ExecutorSummaryWrapper](id) { exec =>
-        assert(exec.info.id === id)
-        assert(!exec.info.isActive)
-      }
-    }
-
-    // End the application.
-    listener.onApplicationEnd(SparkListenerApplicationEnd(42L))
-
-    check[ApplicationInfoWrapper]("id") { app =>
-      assert(app.info.name === "name")
-      assert(app.info.id === "id")
-      assert(app.info.attempts.size === 1)
-
-      val attempt = app.info.attempts.head
-      assert(attempt.attemptId === Some("attempt"))
-      assert(attempt.startTime === new Date(1L))
-      assert(attempt.lastUpdated === new Date(42L))
-      assert(attempt.endTime === new Date(42L))
-      assert(attempt.duration === 41L)
-      assert(attempt.sparkUser === "user")
-      assert(attempt.completed)
     }
   }
 
-  test("storage events") {
-    val listener = new AppStatusListener(store, conf, true)
-    val maxMemory = 42L
+  override def onEnvironmentUpdate(event: SparkListenerEnvironmentUpdate): Unit = {
+    val details = event.environmentDetails
 
-    // Register a couple of block managers.
-    val bm1 = BlockManagerId("1", "1.example.com", 42)
-    val bm2 = BlockManagerId("2", "2.example.com", 84)
-    Seq(bm1, bm2).foreach { bm =>
-      listener.onExecutorAdded(SparkListenerExecutorAdded(1L, bm.executorId,
-        new ExecutorInfo(bm.host, 1, Map())))
-      listener.onBlockManagerAdded(SparkListenerBlockManagerAdded(1L, bm, maxMemory))
-      check[ExecutorSummaryWrapper](bm.executorId) { exec =>
-        assert(exec.info.maxMemory === maxMemory)
+    val jvmInfo = Map(details("JVM Information"): _*)
+    val runtime = new v1.RuntimeInfo(
+      jvmInfo.get("Java Version").orNull,
+      jvmInfo.get("Java Home").orNull,
+      jvmInfo.get("Scala Version").orNull)
+
+    val envInfo = new v1.ApplicationEnvironmentInfo(
+      runtime,
+      details.getOrElse("Spark Properties", Nil),
+      details.getOrElse("System Properties", Nil),
+      details.getOrElse("Classpath Entries", Nil))
+
+    coresPerTask = envInfo.sparkProperties.toMap.get("spark.task.cpus").map(_.toInt)
+      .getOrElse(coresPerTask)
+
+    kvstore.write(new ApplicationEnvironmentInfoWrapper(envInfo))
+  }
+
+  override def onApplicationEnd(event: SparkListenerApplicationEnd): Unit = {
+    val old = appInfo.attempts.head
+    val attempt = v1.ApplicationAttemptInfo(
+      old.attemptId,
+      old.startTime,
+      new Date(event.time),
+      new Date(event.time),
+      event.time - old.startTime.getTime(),
+      old.sparkUser,
+      true,
+      old.appSparkVersion)
+
+    appInfo = v1.ApplicationInfo(
+      appInfo.id,
+      appInfo.name,
+      None,
+      None,
+      None,
+      None,
+      Seq(attempt))
+    kvstore.write(new ApplicationInfoWrapper(appInfo))
+  }
+
+  override def onExecutorAdded(event: SparkListenerExecutorAdded): Unit = {
+    // This needs to be an update in case an executor re-registers after the driver has
+    // marked it as "dead".
+    val exec = getOrCreateExecutor(event.executorId, event.time)
+    exec.host = event.executorInfo.executorHost
+    exec.isActive = true
+    exec.totalCores = event.executorInfo.totalCores
+    exec.maxTasks = event.executorInfo.totalCores / coresPerTask
+    exec.executorLogs = event.executorInfo.logUrlMap
+    liveUpdate(exec, System.nanoTime())
+  }
+
+  override def onExecutorRemoved(event: SparkListenerExecutorRemoved): Unit = {
+    liveExecutors.remove(event.executorId).foreach { exec =>
+      val now = System.nanoTime()
+      activeExecutorCount = math.max(0, activeExecutorCount - 1)
+      exec.isActive = false
+      exec.removeTime = new Date(event.time)
+      exec.removeReason = event.reason
+      update(exec, now, last = true)
+
+      // Remove all RDD distributions that reference the removed executor, in case there wasn't
+      // a corresponding event.
+      liveRDDs.values.foreach { rdd =>
+        if (rdd.removeDistribution(exec)) {
+          update(rdd, now)
+        }
       }
-    }
-
-    val rdd1b1 = RddBlock(1, 1, 1L, 2L)
-    val rdd1b2 = RddBlock(1, 2, 3L, 4L)
-    val rdd2b1 = RddBlock(2, 1, 5L, 6L)
-    val level = StorageLevel.MEMORY_AND_DISK
-
-    // Submit a stage and make sure the RDDs are recorded.
-    val rdd1Info = new RDDInfo(rdd1b1.rddId, "rdd1", 2, level, Nil)
-    val rdd2Info = new RDDInfo(rdd2b1.rddId, "rdd2", 1, level, Nil)
-    val stage = new StageInfo(1, 0, "stage1", 4, Seq(rdd1Info, rdd2Info), Nil, "details1")
-    listener.onStageSubmitted(SparkListenerStageSubmitted(stage, new Properties()))
-
-    check[RDDStorageInfoWrapper](rdd1b1.rddId) { wrapper =>
-      assert(wrapper.info.name === rdd1Info.name)
-      assert(wrapper.info.numPartitions === rdd1Info.numPartitions)
-      assert(wrapper.info.storageLevel === rdd1Info.storageLevel.description)
-    }
-
-    // Add partition 1 replicated on two block managers.
-    listener.onBlockUpdated(SparkListenerBlockUpdated(
-      BlockUpdatedInfo(bm1, rdd1b1.blockId, level, rdd1b1.memSize, rdd1b1.diskSize)))
-
-    check[RDDStorageInfoWrapper](rdd1b1.rddId) { wrapper =>
-      assert(wrapper.info.numCachedPartitions === 1L)
-      assert(wrapper.info.memoryUsed === rdd1b1.memSize)
-      assert(wrapper.info.diskUsed === rdd1b1.diskSize)
-
-      assert(wrapper.info.dataDistribution.isDefined)
-      assert(wrapper.info.dataDistribution.get.size === 1)
-
-      val dist = wrapper.info.dataDistribution.get.head
-      assert(dist.address === bm1.hostPort)
-      assert(dist.memoryUsed === rdd1b1.memSize)
-      assert(dist.diskUsed === rdd1b1.diskSize)
-      assert(dist.memoryRemaining === maxMemory - dist.memoryUsed)
-
-      assert(wrapper.info.partitions.isDefined)
-      assert(wrapper.info.partitions.get.size === 1)
-
-      val part = wrapper.info.partitions.get.head
-      assert(part.blockName === rdd1b1.blockId.name)
-      assert(part.storageLevel === level.description)
-      assert(part.memoryUsed === rdd1b1.memSize)
-      assert(part.diskUsed === rdd1b1.diskSize)
-      assert(part.executors === Seq(bm1.executorId))
-    }
-
-    check[ExecutorSummaryWrapper](bm1.executorId) { exec =>
-      assert(exec.info.rddBlocks === 1L)
-      assert(exec.info.memoryUsed === rdd1b1.memSize)
-      assert(exec.info.diskUsed === rdd1b1.diskSize)
-    }
-
-    listener.onBlockUpdated(SparkListenerBlockUpdated(
-      BlockUpdatedInfo(bm2, rdd1b1.blockId, level, rdd1b1.memSize, rdd1b1.diskSize)))
-
-    check[RDDStorageInfoWrapper](rdd1b1.rddId) { wrapper =>
-      assert(wrapper.info.numCachedPartitions === 1L)
-      assert(wrapper.info.memoryUsed === rdd1b1.memSize * 2)
-      assert(wrapper.info.diskUsed === rdd1b1.diskSize * 2)
-      assert(wrapper.info.dataDistribution.get.size === 2L)
-      assert(wrapper.info.partitions.get.size === 1L)
-
-      val dist = wrapper.info.dataDistribution.get.find(_.address == bm2.hostPort).get
-      assert(dist.memoryUsed === rdd1b1.memSize)
-      assert(dist.diskUsed === rdd1b1.diskSize)
-      assert(dist.memoryRemaining === maxMemory - dist.memoryUsed)
-
-      val part = wrapper.info.partitions.get(0)
-      assert(part.memoryUsed === rdd1b1.memSize * 2)
-      assert(part.diskUsed === rdd1b1.diskSize * 2)
-      assert(part.executors === Seq(bm1.executorId, bm2.executorId))
-    }
-
-    check[ExecutorSummaryWrapper](bm2.executorId) { exec =>
-      assert(exec.info.rddBlocks === 1L)
-      assert(exec.info.memoryUsed === rdd1b1.memSize)
-      assert(exec.info.diskUsed === rdd1b1.diskSize)
-    }
-
-    // Add a second partition only to bm 1.
-    listener.onBlockUpdated(SparkListenerBlockUpdated(
-      BlockUpdatedInfo(bm1, rdd1b2.blockId, level, rdd1b2.memSize, rdd1b2.diskSize)))
-
-    check[RDDStorageInfoWrapper](rdd1b1.rddId) { wrapper =>
-      assert(wrapper.info.numCachedPartitions === 2L)
-      assert(wrapper.info.memoryUsed === 2 * rdd1b1.memSize + rdd1b2.memSize)
-      assert(wrapper.info.diskUsed === 2 * rdd1b1.diskSize + rdd1b2.diskSize)
-      assert(wrapper.info.dataDistribution.get.size === 2L)
-      assert(wrapper.info.partitions.get.size === 2L)
-
-      val dist = wrapper.info.dataDistribution.get.find(_.address == bm1.hostPort).get
-      assert(dist.memoryUsed === rdd1b1.memSize + rdd1b2.memSize)
-      assert(dist.diskUsed === rdd1b1.diskSize + rdd1b2.diskSize)
-      assert(dist.memoryRemaining === maxMemory - dist.memoryUsed)
-
-      val part = wrapper.info.partitions.get.find(_.blockName === rdd1b2.blockId.name).get
-      assert(part.storageLevel === level.description)
-      assert(part.memoryUsed === rdd1b2.memSize)
-      assert(part.diskUsed === rdd1b2.diskSize)
-      assert(part.executors === Seq(bm1.executorId))
-    }
-
-    check[ExecutorSummaryWrapper](bm1.executorId) { exec =>
-      assert(exec.info.rddBlocks === 2L)
-      assert(exec.info.memoryUsed === rdd1b1.memSize + rdd1b2.memSize)
-      assert(exec.info.diskUsed === rdd1b1.diskSize + rdd1b2.diskSize)
-    }
-
-    // Remove block 1 from bm 1.
-    listener.onBlockUpdated(SparkListenerBlockUpdated(
-      BlockUpdatedInfo(bm1, rdd1b1.blockId, StorageLevel.NONE, rdd1b1.memSize, rdd1b1.diskSize)))
-
-    check[RDDStorageInfoWrapper](rdd1b1.rddId) { wrapper =>
-      assert(wrapper.info.numCachedPartitions === 2L)
-      assert(wrapper.info.memoryUsed === rdd1b1.memSize + rdd1b2.memSize)
-      assert(wrapper.info.diskUsed === rdd1b1.diskSize + rdd1b2.diskSize)
-      assert(wrapper.info.dataDistribution.get.size === 2L)
-      assert(wrapper.info.partitions.get.size === 2L)
-
-      val dist = wrapper.info.dataDistribution.get.find(_.address == bm1.hostPort).get
-      assert(dist.memoryUsed === rdd1b2.memSize)
-      assert(dist.diskUsed === rdd1b2.diskSize)
-      assert(dist.memoryRemaining === maxMemory - dist.memoryUsed)
-
-      val part = wrapper.info.partitions.get.find(_.blockName === rdd1b1.blockId.name).get
-      assert(part.storageLevel === level.description)
-      assert(part.memoryUsed === rdd1b1.memSize)
-      assert(part.diskUsed === rdd1b1.diskSize)
-      assert(part.executors === Seq(bm2.executorId))
-    }
-
-    check[ExecutorSummaryWrapper](bm1.executorId) { exec =>
-      assert(exec.info.rddBlocks === 1L)
-      assert(exec.info.memoryUsed === rdd1b2.memSize)
-      assert(exec.info.diskUsed === rdd1b2.diskSize)
-    }
-
-    // Remove block 1 from bm 2. This should leave only block 2's info in the store.
-    listener.onBlockUpdated(SparkListenerBlockUpdated(
-      BlockUpdatedInfo(bm2, rdd1b1.blockId, StorageLevel.NONE, rdd1b1.memSize, rdd1b1.diskSize)))
-
-    check[RDDStorageInfoWrapper](rdd1b1.rddId) { wrapper =>
-      assert(wrapper.info.numCachedPartitions === 1L)
-      assert(wrapper.info.memoryUsed === rdd1b2.memSize)
-      assert(wrapper.info.diskUsed === rdd1b2.diskSize)
-      assert(wrapper.info.dataDistribution.get.size === 1L)
-      assert(wrapper.info.partitions.get.size === 1L)
-      assert(wrapper.info.partitions.get(0).blockName === rdd1b2.blockId.name)
-    }
-
-    check[ExecutorSummaryWrapper](bm1.executorId) { exec =>
-      assert(exec.info.rddBlocks === 1L)
-      assert(exec.info.memoryUsed === rdd1b2.memSize)
-      assert(exec.info.diskUsed === rdd1b2.diskSize)
-    }
-
-    check[ExecutorSummaryWrapper](bm2.executorId) { exec =>
-      assert(exec.info.rddBlocks === 0L)
-      assert(exec.info.memoryUsed === 0L)
-      assert(exec.info.diskUsed === 0L)
-    }
-
-    // Add a block from a different RDD. Verify the executor is updated correctly and also that
-    // the distribution data for both rdds is updated to match the remaining memory.
-    listener.onBlockUpdated(SparkListenerBlockUpdated(
-      BlockUpdatedInfo(bm1, rdd2b1.blockId, level, rdd2b1.memSize, rdd2b1.diskSize)))
-
-    check[ExecutorSummaryWrapper](bm1.executorId) { exec =>
-      assert(exec.info.rddBlocks === 2L)
-      assert(exec.info.memoryUsed === rdd1b2.memSize + rdd2b1.memSize)
-      assert(exec.info.diskUsed === rdd1b2.diskSize + rdd2b1.diskSize)
-    }
-
-    check[RDDStorageInfoWrapper](rdd1b2.rddId) { wrapper =>
-      assert(wrapper.info.dataDistribution.get.size === 1L)
-      val dist = wrapper.info.dataDistribution.get(0)
-      assert(dist.memoryRemaining === maxMemory - rdd2b1.memSize - rdd1b2.memSize )
-    }
-
-    check[RDDStorageInfoWrapper](rdd2b1.rddId) { wrapper =>
-      assert(wrapper.info.dataDistribution.get.size === 1L)
-
-      val dist = wrapper.info.dataDistribution.get(0)
-      assert(dist.memoryUsed === rdd2b1.memSize)
-      assert(dist.diskUsed === rdd2b1.diskSize)
-      assert(dist.memoryRemaining === maxMemory - rdd2b1.memSize - rdd1b2.memSize )
-    }
-
-    // Unpersist RDD1.
-    listener.onUnpersistRDD(SparkListenerUnpersistRDD(rdd1b1.rddId))
-    intercept[NoSuchElementException] {
-      check[RDDStorageInfoWrapper](rdd1b1.rddId) { _ => () }
-    }
-
-    // Update a StreamBlock.
-    val stream1 = StreamBlockId(1, 1L)
-    listener.onBlockUpdated(SparkListenerBlockUpdated(
-      BlockUpdatedInfo(bm1, stream1, level, 1L, 1L)))
-
-    check[StreamBlockData](Array(stream1.name, bm1.executorId)) { stream =>
-      assert(stream.name === stream1.name)
-      assert(stream.executorId === bm1.executorId)
-      assert(stream.hostPort === bm1.hostPort)
-      assert(stream.storageLevel === level.description)
-      assert(stream.useMemory === level.useMemory)
-      assert(stream.useDisk === level.useDisk)
-      assert(stream.deserialized === level.deserialized)
-      assert(stream.memSize === 1L)
-      assert(stream.diskSize === 1L)
-    }
-
-    // Drop a StreamBlock.
-    listener.onBlockUpdated(SparkListenerBlockUpdated(
-      BlockUpdatedInfo(bm1, stream1, StorageLevel.NONE, 0L, 0L)))
-    intercept[NoSuchElementException] {
-      check[StreamBlockData](stream1.name) { _ => () }
     }
   }
 
-  test("eviction of old data") {
-    val testConf = conf.clone()
-      .set(MAX_RETAINED_JOBS, 2)
-      .set(MAX_RETAINED_STAGES, 2)
-      .set(MAX_RETAINED_TASKS_PER_STAGE, 2)
-      .set(MAX_RETAINED_DEAD_EXECUTORS, 1)
-    val listener = new AppStatusListener(store, testConf, true)
+  override def onExecutorBlacklisted(event: SparkListenerExecutorBlacklisted): Unit = {
+    updateBlackListStatus(event.executorId, true)
+  }
 
-    // Start 3 jobs, all should be kept. Stop one, it should be evicted.
-    time += 1
-    listener.onJobStart(SparkListenerJobStart(1, time, Nil, null))
-    listener.onJobStart(SparkListenerJobStart(2, time, Nil, null))
-    listener.onJobStart(SparkListenerJobStart(3, time, Nil, null))
-    assert(store.count(classOf[JobDataWrapper]) === 3)
+  override def onExecutorUnblacklisted(event: SparkListenerExecutorUnblacklisted): Unit = {
+    updateBlackListStatus(event.executorId, false)
+  }
 
-    time += 1
-    listener.onJobEnd(SparkListenerJobEnd(2, time, JobSucceeded))
-    assert(store.count(classOf[JobDataWrapper]) === 2)
-    intercept[NoSuchElementException] {
-      store.read(classOf[JobDataWrapper], 2)
+  override def onNodeBlacklisted(event: SparkListenerNodeBlacklisted): Unit = {
+    updateNodeBlackList(event.hostId, true)
+  }
+
+  override def onNodeUnblacklisted(event: SparkListenerNodeUnblacklisted): Unit = {
+    updateNodeBlackList(event.hostId, false)
+  }
+
+  private def updateBlackListStatus(execId: String, blacklisted: Boolean): Unit = {
+    liveExecutors.get(execId).foreach { exec =>
+      exec.isBlacklisted = blacklisted
+      liveUpdate(exec, System.nanoTime())
+    }
+  }
+
+  private def updateNodeBlackList(host: String, blacklisted: Boolean): Unit = {
+    val now = System.nanoTime()
+
+    // Implicitly (un)blacklist every executor associated with the node.
+    liveExecutors.values.foreach { exec =>
+      if (exec.hostname == host) {
+        exec.isBlacklisted = blacklisted
+        liveUpdate(exec, now)
+      }
+    }
+  }
+
+  override def onJobStart(event: SparkListenerJobStart): Unit = {
+    val now = System.nanoTime()
+
+    // Compute (a potential over-estimate of) the number of tasks that will be run by this job.
+    // This may be an over-estimate because the job start event references all of the result
+    // stages' transitive stage dependencies, but some of these stages might be skipped if their
+    // output is available from earlier runs.
+    // See https://github.com/apache/spark/pull/3009 for a more extensive discussion.
+    val numTasks = {
+      val missingStages = event.stageInfos.filter(_.completionTime.isEmpty)
+      missingStages.map(_.numTasks).sum
     }
 
-    // Start 3 stages, all should be kept. Stop 2 of them, the stopped one with the lowest id should
-    // be deleted. Start a new attempt of the second stopped one, and verify that the stage graph
-    // data is not deleted.
-    time += 1
-    val stages = Seq(
-      new StageInfo(1, 0, "stage1", 4, Nil, Nil, "details1"),
-      new StageInfo(2, 0, "stage2", 4, Nil, Nil, "details2"),
-      new StageInfo(3, 0, "stage3", 4, Nil, Nil, "details3"))
+    val lastStageInfo = event.stageInfos.sortBy(_.stageId).lastOption
+    val lastStageName = lastStageInfo.map(_.name).getOrElse("(Unknown Stage Name)")
+    val jobGroup = Option(event.properties)
+      .flatMap { p => Option(p.getProperty(SparkContext.SPARK_JOB_GROUP_ID)) }
 
-    // Graph data is generated by the job start event, so fire it.
-    listener.onJobStart(SparkListenerJobStart(4, time, stages, null))
+    val job = new LiveJob(
+      event.jobId,
+      lastStageName,
+      if (event.time > 0) Some(new Date(event.time)) else None,
+      event.stageIds,
+      jobGroup,
+      numTasks)
+    liveJobs.put(event.jobId, job)
+    liveUpdate(job, now)
+
+    event.stageInfos.foreach { stageInfo =>
+      // A new job submission may re-use an existing stage, so this code needs to do an update
+      // instead of just a write.
+      val stage = getOrCreateStage(stageInfo)
+      stage.jobs :+= job
+      stage.jobIds += event.jobId
+      liveUpdate(stage, now)
+    }
+
+    // Create the graph data for all the job's stages.
+    event.stageInfos.foreach { stage =>
+      val graph = RDDOperationGraph.makeOperationGraph(stage, maxGraphRootNodes)
+      val uigraph = new RDDOperationGraphWrapper(
+        stage.stageId,
+        graph.edges,
+        graph.outgoingEdges,
+        graph.incomingEdges,
+        newRDDOperationCluster(graph.rootCluster))
+      kvstore.write(uigraph)
+    }
+  }
+
+  private def newRDDOperationCluster(cluster: RDDOperationCluster): RDDOperationClusterWrapper = {
+    new RDDOperationClusterWrapper(
+      cluster.id,
+      cluster.name,
+      cluster.childNodes,
+      cluster.childClusters.map(newRDDOperationCluster))
+  }
+
+  override def onJobEnd(event: SparkListenerJobEnd): Unit = {
+    liveJobs.remove(event.jobId).foreach { job =>
+      val now = System.nanoTime()
+
+      // Check if there are any pending stages that match this job; mark those as skipped.
+      val it = liveStages.entrySet.iterator()
+      while (it.hasNext()) {
+        val e = it.next()
+        if (job.stageIds.contains(e.getKey()._1)) {
+          val stage = e.getValue()
+          stage.status = v1.StageStatus.SKIPPED
+          job.skippedStages += stage.info.stageId
+          job.skippedTasks += stage.info.numTasks
+          it.remove()
+          update(stage, now)
+        }
+      }
+
+      job.status = event.jobResult match {
+        case JobSucceeded => JobExecutionStatus.SUCCEEDED
+        case JobFailed(_) => JobExecutionStatus.FAILED
+      }
+
+      job.completionTime = if (event.time > 0) Some(new Date(event.time)) else None
+      update(job, now, last = true)
+    }
+
+    appSummary = new AppSummary(appSummary.numCompletedJobs + 1, appSummary.numCompletedStages)
+    kvstore.write(appSummary)
+  }
+
+  override def onStageSubmitted(event: SparkListenerStageSubmitted): Unit = {
+    val now = System.nanoTime()
+    val stage = getOrCreateStage(event.stageInfo)
+    stage.status = v1.StageStatus.ACTIVE
+    stage.schedulingPool = Option(event.properties).flatMap { p =>
+      Option(p.getProperty("spark.scheduler.pool"))
+    }.getOrElse(SparkUI.DEFAULT_POOL_NAME)
+
+    // Look at all active jobs to find the ones that mention this stage.
+    stage.jobs = liveJobs.values
+      .filter(_.stageIds.contains(event.stageInfo.stageId))
+      .toSeq
+    stage.jobIds = stage.jobs.map(_.jobId).toSet
+
+    stage.description = Option(event.properties).flatMap { p =>
+      Option(p.getProperty(SparkContext.SPARK_JOB_DESCRIPTION))
+    }
+
+    stage.jobs.foreach { job =>
+      job.completedStages = job.completedStages - event.stageInfo.stageId
+      job.activeStages += 1
+      liveUpdate(job, now)
+    }
+
+    val pool = pools.getOrElseUpdate(stage.schedulingPool, new SchedulerPool(stage.schedulingPool))
+    pool.stageIds = pool.stageIds + event.stageInfo.stageId
+    update(pool, now)
+
+    event.stageInfo.rddInfos.foreach { info =>
+      if (info.storageLevel.isValid) {
+        liveUpdate(liveRDDs.getOrElseUpdate(info.id, new LiveRDD(info)), now)
+      }
+    }
+
+    liveUpdate(stage, now)
+  }
+
+  override def onTaskStart(event: SparkListenerTaskStart): Unit = {
+    val now = System.nanoTime()
+    val task = new LiveTask(event.taskInfo, event.stageId, event.stageAttemptId, lastUpdateTime)
+    liveTasks.put(event.taskInfo.taskId, task)
+    liveUpdate(task, now)
+
+    Option(liveStages.get((event.stageId, event.stageAttemptId))).foreach { stage =>
+      stage.activeTasks += 1
+      stage.firstLaunchTime = math.min(stage.firstLaunchTime, event.taskInfo.launchTime)
+
+      val locality = event.taskInfo.taskLocality.toString()
+      val count = stage.localitySummary.getOrElse(locality, 0L) + 1L
+      stage.localitySummary = stage.localitySummary ++ Map(locality -> count)
+      maybeUpdate(stage, now)
+
+      stage.jobs.foreach { job =>
+        job.activeTasks += 1
+        maybeUpdate(job, now)
+      }
+
+      if (stage.savedTasks.incrementAndGet() > maxTasksPerStage && !stage.cleaning) {
+        stage.cleaning = true
+        kvstore.doAsync {
+          cleanupTasks(stage)
+        }
+      }
+    }
+
+    liveExecutors.get(event.taskInfo.executorId).foreach { exec =>
+      exec.activeTasks += 1
+      exec.totalTasks += 1
+      maybeUpdate(exec, now)
+    }
+  }
+
+  override def onTaskGettingResult(event: SparkListenerTaskGettingResult): Unit = {
+    // Call update on the task so that the "getting result" time is written to the store; the
+    // value is part of the mutable TaskInfo state that the live entity already references.
+    liveTasks.get(event.taskInfo.taskId).foreach { task =>
+      maybeUpdate(task, System.nanoTime())
+    }
+  }
+
+  override def onTaskEnd(event: SparkListenerTaskEnd): Unit = {
+    // TODO: can this really happen?
+    if (event.taskInfo == null) {
+      return
+    }
+
+    val now = System.nanoTime()
+
+    val metricsDelta = liveTasks.remove(event.taskInfo.taskId).map { task =>
+      task.info = event.taskInfo
+
+      val errorMessage = event.reason match {
+        case Success =>
+          None
+        case k: TaskKilled =>
+          Some(k.reason)
+        case e: ExceptionFailure => // Handle ExceptionFailure because we might have accumUpdates
+          Some(e.toErrorString)
+        case e: TaskFailedReason => // All other failure cases
+          Some(e.toErrorString)
+        case other =>
+          logInfo(s"Unhandled task end reason: $other")
+          None
+      }
+      task.errorMessage = errorMessage
+      val delta = task.updateMetrics(event.taskMetrics)
+      update(task, now, last = true)
+      delta
+    }.orNull
+
+    val (completedDelta, failedDelta, killedDelta) = event.reason match {
+      case Success =>
+        (1, 0, 0)
+      case _: TaskKilled =>
+        (0, 0, 1)
+      case _: TaskCommitDenied =>
+        (0, 0, 1)
+      case _ =>
+        (0, 1, 0)
+    }
+
+    Option(liveStages.get((event.stageId, event.stageAttemptId))).foreach { stage =>
+      if (metricsDelta != null) {
+        stage.metrics = LiveEntityHelpers.addMetrics(stage.metrics, metricsDelta)
+      }
+      stage.activeTasks -= 1
+      stage.completedTasks += completedDelta
+      if (completedDelta > 0) {
+        stage.completedIndices.add(event.taskInfo.index)
+      }
+      stage.failedTasks += failedDelta
+      stage.killedTasks += killedDelta
+      if (killedDelta > 0) {
+        stage.killedSummary = killedTasksSummary(event.reason, stage.killedSummary)
+      }
+      maybeUpdate(stage, now)
+
+      // Store both stage ID and task index in a single long variable for tracking at job level.
+      val taskIndex = (event.stageId.toLong << Integer.SIZE) | event.taskInfo.index
+      stage.jobs.foreach { job =>
+        job.activeTasks -= 1
+        job.completedTasks += completedDelta
+        if (completedDelta > 0) {
+          job.completedIndices.add(taskIndex)
+        }
+        job.failedTasks += failedDelta
+        job.killedTasks += killedDelta
+        if (killedDelta > 0) {
+          job.killedSummary = killedTasksSummary(event.reason, job.killedSummary)
+        }
+        maybeUpdate(job, now)
+      }
+
+      val esummary = stage.executorSummary(event.taskInfo.executorId)
+      esummary.taskTime += event.taskInfo.duration
+      esummary.succeededTasks += completedDelta
+      esummary.failedTasks += failedDelta
+      esummary.killedTasks += killedDelta
+      if (metricsDelta != null) {
+        esummary.metrics = LiveEntityHelpers.addMetrics(esummary.metrics, metricsDelta)
+      }
+      maybeUpdate(esummary, now)
+
+      if (!stage.cleaning && stage.savedTasks.get() > maxTasksPerStage) {
+        stage.cleaning = true
+        kvstore.doAsync {
+          cleanupTasks(stage)
+        }
+      }
+    }
+
+    liveExecutors.get(event.taskInfo.executorId).foreach { exec =>
+      exec.activeTasks -= 1
+      exec.completedTasks += completedDelta
+      exec.failedTasks += failedDelta
+      exec.totalDuration += event.taskInfo.duration
+
+      // Note: For resubmitted tasks, we continue to use the metrics that belong to the
+      // first attempt of this task. This may not be 100% accurate because the first attempt
+      // could have failed half-way through. The correct fix would be to keep track of the
+      // metrics added by each attempt, but this is much more complicated.
+      if (event.reason != Resubmitted) {
+        if (event.taskMetrics != null) {
+          val readMetrics = event.taskMetrics.shuffleReadMetrics
+          exec.totalGcTime += event.taskMetrics.jvmGCTime
+          exec.totalInputBytes += event.taskMetrics.inputMetrics.bytesRead
+          exec.totalShuffleRead += readMetrics.localBytesRead + readMetrics.remoteBytesRead
+          exec.totalShuffleWrite += event.taskMetrics.shuffleWriteMetrics.bytesWritten
+        }
+      }
+
+      // Force an update on live applications when the number of active tasks reaches 0. This is
+      // checked in some tests (e.g. SQLTestUtilsBase) so it needs to be reliably up to date.
+      if (exec.activeTasks == 0) {
+        liveUpdate(exec, now)
+      } else {
+        maybeUpdate(exec, now)
+      }
+    }
+  }
+
+  override def onStageCompleted(event: SparkListenerStageCompleted): Unit = {
+    val maybeStage =
+      Option(liveStages.remove((event.stageInfo.stageId, event.stageInfo.attemptNumber)))
+    maybeStage.foreach { stage =>
+      val now = System.nanoTime()
+      stage.info = event.stageInfo
+
+      // Because of SPARK-20205, old event logs may contain valid stages without a submission time
+      // in their start event. In those cases, we can only detect whether a stage was skipped by
+      // waiting until the completion event, at which point the field would have been set.
+      stage.status = event.stageInfo.failureReason match {
+        case Some(_) => v1.StageStatus.FAILED
+        case _ if event.stageInfo.submissionTime.isDefined => v1.StageStatus.COMPLETE
+        case _ => v1.StageStatus.SKIPPED
+      }
+
+      stage.jobs.foreach { job =>
+        stage.status match {
+          case v1.StageStatus.COMPLETE =>
+            job.completedStages += event.stageInfo.stageId
+          case v1.StageStatus.SKIPPED =>
+            job.skippedStages += event.stageInfo.stageId
+            job.skippedTasks += event.stageInfo.numTasks
+          case _ =>
+            job.failedStages += 1
+        }
+        job.activeStages -= 1
+        liveUpdate(job, now)
+      }
+
+      pools.get(stage.schedulingPool).foreach { pool =>
+        pool.stageIds = pool.stageIds - event.stageInfo.stageId
+        update(pool, now)
+      }
+
+      stage.executorSummaries.values.foreach(update(_, now))
+      update(stage, now, last = true)
+    }
+
+    appSummary = new AppSummary(appSummary.numCompletedJobs, appSummary.numCompletedStages + 1)
+    kvstore.write(appSummary)
+  }
+
+  override def onBlockManagerAdded(event: SparkListenerBlockManagerAdded): Unit = {
+    // This needs to set fields that are already set by onExecutorAdded because the driver is
+    // considered an "executor" in the UI, but does not have a SparkListenerExecutorAdded event.
+    val exec = getOrCreateExecutor(event.blockManagerId.executorId, event.time)
+    exec.hostPort = event.blockManagerId.hostPort
+    event.maxOnHeapMem.foreach { _ =>
+      exec.totalOnHeap = event.maxOnHeapMem.get
+      exec.totalOffHeap = event.maxOffHeapMem.get
+    }
+    exec.isActive = true
+    exec.maxMemory = event.maxMem
+    liveUpdate(exec, System.nanoTime())
+  }
+
+  override def onBlockManagerRemoved(event: SparkListenerBlockManagerRemoved): Unit = {
+    // Nothing to do here. Covered by onExecutorRemoved.
+  }
+
+  override def onUnpersistRDD(event: SparkListenerUnpersistRDD): Unit = {
+    liveRDDs.remove(event.rddId)
+    kvstore.delete(classOf[RDDStorageInfoWrapper], event.rddId)
+  }
+
+  override def onExecutorMetricsUpdate(event: SparkListenerExecutorMetricsUpdate): Unit = {
+    val now = System.nanoTime()
+
+    event.accumUpdates.foreach { case (taskId, sid, sAttempt, accumUpdates) =>
+      liveTasks.get(taskId).foreach { task =>
+        val metrics = TaskMetrics.fromAccumulatorInfos(accumUpdates)
+        val delta = task.updateMetrics(metrics)
+        maybeUpdate(task, now)
+
+        Option(liveStages.get((sid, sAttempt))).foreach { stage =>
+          stage.metrics = LiveEntityHelpers.addMetrics(stage.metrics, delta)
+          maybeUpdate(stage, now)
+
+          val esummary = stage.executorSummary(event.execId)
+          esummary.metrics = LiveEntityHelpers.addMetrics(esummary.metrics, delta)
+          maybeUpdate(esummary, now)
+        }
+      }
+    }
+  }
+
+  override def onBlockUpdated(event: SparkListenerBlockUpdated): Unit = {
+    event.blockUpdatedInfo.blockId match {
+      case block: RDDBlockId => updateRDDBlock(event, block)
+      case stream: StreamBlockId => updateStreamBlock(event, stream)
+      case _ =>
+    }
+  }
+
+  /** Flush all live entities' data to the underlying store. */
+  private def flush(): Unit = {
+    val now = System.nanoTime()
+    liveStages.values.asScala.foreach { stage =>
+      update(stage, now)
+      stage.executorSummaries.values.foreach(update(_, now))
+    }
+    liveJobs.values.foreach(update(_, now))
+    liveExecutors.values.foreach(update(_, now))
+    liveTasks.values.foreach(update(_, now))
+    liveRDDs.values.foreach(update(_, now))
+    pools.values.foreach(update(_, now))
+  }
+
+  /**
+   * Shortcut to get active stages quickly in a live application, for use by the console
+   * progress bar.
+   */
+  def activeStages(): Seq[v1.StageData] = {
+    liveStages.values.asScala
+      .filter(_.info.submissionTime.isDefined)
+      .map(_.toApi())
+      .toList
+      .sortBy(_.stageId)
+  }
+
+  private def updateRDDBlock(event: SparkListenerBlockUpdated, block: RDDBlockId): Unit = {
+    val now = System.nanoTime()
+    val executorId = event.blockUpdatedInfo.blockManagerId.executorId
+
+    // Whether values are being added to or removed from the existing accounting.
+    val storageLevel = event.blockUpdatedInfo.storageLevel
+    val diskDelta = event.blockUpdatedInfo.diskSize * (if (storageLevel.useDisk) 1 else -1)
+    val memoryDelta = event.blockUpdatedInfo.memSize * (if (storageLevel.useMemory) 1 else -1)
+
+    // Function to apply a delta to a value, but ensure that it doesn't go negative.
+    def newValue(old: Long, delta: Long): Long = math.max(0, old + delta)
+
+    val updatedStorageLevel = if (storageLevel.isValid) {
+      Some(storageLevel.description)
+    } else {
+      None
+    }
+
+    // We need information about the executor to update some memory accounting values in the
+    // RDD info, so read that beforehand.
+    val maybeExec = liveExecutors.get(executorId)
+    var rddBlocksDelta = 0
+
+    // Update the executor stats first, since they are used to calculate the free memory
+    // on tracked RDD distributions.
+    maybeExec.foreach { exec =>
+      if (exec.hasMemoryInfo) {
+        if (storageLevel.useOffHeap) {
+          exec.usedOffHeap = newValue(exec.usedOffHeap, memoryDelta)
+        } else {
+          exec.usedOnHeap = newValue(exec.usedOnHeap, memoryDelta)
+        }
+      }
+      exec.memoryUsed = newValue(exec.memoryUsed, memoryDelta)
+      exec.diskUsed = newValue(exec.diskUsed, diskDelta)
+    }
+
+    // Update the block entry in the RDD info, keeping track of the deltas above so that we
+    // can update the executor information too.
+    liveRDDs.get(block.rddId).foreach { rdd =>
+      if (updatedStorageLevel.isDefined) {
+        rdd.setStorageLevel(updatedStorageLevel.get)
+      }
+
+      val partition = rdd.partition(block.name)
+
+      val executors = if (updatedStorageLevel.isDefined) {
+        val current = partition.executors
+        if (current.contains(executorId)) {
+          current
+        } else {
+          rddBlocksDelta = 1
+          current :+ executorId
+        }
+      } else {
+        rddBlocksDelta = -1
+        partition.executors.filter(_ != executorId)
+      }
+
+      // Only update the partition if it's still stored in some executor, otherwise get rid of it.
+      if (executors.nonEmpty) {
+        partition.update(executors, rdd.storageLevel,
+          newValue(partition.memoryUsed, memoryDelta),
+          newValue(partition.diskUsed, diskDelta))
+      } else {
+        rdd.removePartition(block.name)
+      }
+
+      maybeExec.foreach { exec =>
+        if (exec.rddBlocks + rddBlocksDelta > 0) {
+          val dist = rdd.distribution(exec)
+          dist.memoryUsed = newValue(dist.memoryUsed, memoryDelta)
+          dist.diskUsed = newValue(dist.diskUsed, diskDelta)
+
+          if (exec.hasMemoryInfo) {
+            if (storageLevel.useOffHeap) {
+              dist.offHeapUsed = newValue(dist.offHeapUsed, memoryDelta)
+            } else {
+              dist.onHeapUsed = newValue(dist.onHeapUsed, memoryDelta)
+            }
+          }
+          dist.lastUpdate = null
+        } else {
+          rdd.removeDistribution(exec)
+        }
+
+        // Trigger an update on other RDDs so that the free memory information is updated.
+        liveRDDs.values.foreach { otherRdd =>
+          if (otherRdd.info.id != block.rddId) {
+            otherRdd.distributionOpt(exec).foreach { dist =>
+              dist.lastUpdate = null
+              update(otherRdd, now)
+            }
+          }
+        }
+      }
+
+      rdd.memoryUsed = newValue(rdd.memoryUsed, memoryDelta)
+      rdd.diskUsed = newValue(rdd.diskUsed, diskDelta)
+      update(rdd, now)
+    }
+
+    // Finish updating the executor now that we know the delta in the number of blocks.
+    maybeExec.foreach { exec =>
+      exec.rddBlocks += rddBlocksDelta
+      maybeUpdate(exec, now)
+    }
+  }
+
+  private def getOrCreateExecutor(executorId: String, addTime: Long): LiveExecutor = {
+    liveExecutors.getOrElseUpdate(executorId, {
+      activeExecutorCount += 1
+      new LiveExecutor(executorId, addTime)
+    })
+  }
+
+  private def updateStreamBlock(event: SparkListenerBlockUpdated, stream: StreamBlockId): Unit = {
+    val storageLevel = event.blockUpdatedInfo.storageLevel
+    if (storageLevel.isValid) {
+      val data = new StreamBlockData(
+        stream.name,
+        event.blockUpdatedInfo.blockManagerId.executorId,
+        event.blockUpdatedInfo.blockManagerId.hostPort,
+        storageLevel.description,
+        storageLevel.useMemory,
+        storageLevel.useDisk,
+        storageLevel.deserialized,
+        event.blockUpdatedInfo.memSize,
+        event.blockUpdatedInfo.diskSize)
+      kvstore.write(data)
+    } else {
+      kvstore.delete(classOf[StreamBlockData],
+        Array(stream.name, event.blockUpdatedInfo.blockManagerId.executorId))
+    }
+  }
+
+  private def getOrCreateStage(info: StageInfo): LiveStage = {
+    val stage = liveStages.computeIfAbsent((info.stageId, info.attemptNumber),
+      new Function[(Int, Int), LiveStage]() {
+        override def apply(key: (Int, Int)): LiveStage = new LiveStage()
+      })
+    stage.info = info
+    stage
+  }
+
+  private def killedTasksSummary(
+      reason: TaskEndReason,
+      oldSummary: Map[String, Int]): Map[String, Int] = {
+    reason match {
+      case k: TaskKilled =>
+        oldSummary.updated(k.reason, oldSummary.getOrElse(k.reason, 0) + 1)
+      case denied: TaskCommitDenied =>
+        val reason = denied.toErrorString
+        oldSummary.updated(reason, oldSummary.getOrElse(reason, 0) + 1)
+      case _ =>
+        oldSummary
+    }
+  }
+
+  private def update(entity: LiveEntity, now: Long, last: Boolean = false): Unit = {
+    entity.write(kvstore, now, checkTriggers = last)
+  }
+
+  /** Update a live entity only if it hasn't been updated in the last configured period. */
+  private def maybeUpdate(entity: LiveEntity, now: Long): Unit = {
+    if (live && liveUpdatePeriodNs >= 0 && now - entity.lastWriteTime > liveUpdatePeriodNs) {
+      update(entity, now)
+    }
+  }
+
+  /** Update an entity only if in a live app; avoids redundant writes when replaying logs. */
+  private def liveUpdate(entity: LiveEntity, now: Long): Unit = {
+    if (live) {
+      update(entity, now)
+    }
+  }
+
+  private def cleanupExecutors(count: Long): Unit = {
+    // Because the limit is on the number of *dead* executors, we need to calculate whether
+    // there are actually enough dead executors to be deleted.
+    val threshold = conf.get(MAX_RETAINED_DEAD_EXECUTORS)
+    val dead = count - activeExecutorCount
+
+    if (dead > threshold) {
+      val countToDelete = calculateNumberToRemove(dead, threshold)
+      val toDelete = kvstore.view(classOf[ExecutorSummaryWrapper]).index("active")
+        .max(countToDelete).first(false).last(false).asScala.toSeq
+      toDelete.foreach { e => kvstore.delete(e.getClass(), e.info.id) }
+    }
+  }
+
+  private def cleanupJobs(count: Long): Unit = {
+    val countToDelete = calculateNumberToRemove(count, conf.get(MAX_RETAINED_JOBS))
+    if (countToDelete <= 0L) {
+      return
+    }
+
+    val view = kvstore.view(classOf[JobDataWrapper]).index("completionTime").first(0L)
+    val toDelete = KVUtils.viewToSeq(view, countToDelete.toInt) { j =>
+      j.info.status != JobExecutionStatus.RUNNING && j.info.status != JobExecutionStatus.UNKNOWN
+    }
+    toDelete.foreach { j => kvstore.delete(j.getClass(), j.info.jobId) }
+  }
+
+  private def cleanupStages(count: Long): Unit = {
+    val countToDelete = calculateNumberToRemove(count, conf.get(MAX_RETAINED_STAGES))
+    if (countToDelete <= 0L) {
+      return
+    }
+
+    // As the completion time of a skipped stage is always -1, we will remove skipped stages first.
+    // This is safe since the job itself contains enough information to render skipped stages in the
+    // UI.
+    val view = kvstore.view(classOf[StageDataWrapper]).index("completionTime")
+    val stages = KVUtils.viewToSeq(view, countToDelete.toInt) { s =>
+      s.info.status != v1.StageStatus.ACTIVE && s.info.status != v1.StageStatus.PENDING
+    }
 
     stages.foreach { s =>
-      time += 1
-      s.submissionTime = Some(time)
-      listener.onStageSubmitted(SparkListenerStageSubmitted(s, new Properties()))
-    }
+      val key = Array(s.info.stageId, s.info.attemptId)
+      kvstore.delete(s.getClass(), key)
 
-    assert(store.count(classOf[StageDataWrapper]) === 3)
-    assert(store.count(classOf[RDDOperationGraphWrapper]) === 3)
+      val execSummaries = kvstore.view(classOf[ExecutorStageSummaryWrapper])
+        .index("stage")
+        .first(key)
+        .last(key)
+        .asScala
+        .toSeq
+      execSummaries.foreach { e =>
+        kvstore.delete(e.getClass(), e.id)
+      }
 
-    val dropped = stages.drop(1).head
+      val tasks = kvstore.view(classOf[TaskDataWrapper])
+        .index("stage")
+        .first(key)
+        .last(key)
+        .asScala
 
-    // Cache some quantiles by calling AppStatusStore.taskSummary(). For quantiles to be
-    // calculated, we need at least one finished task. The code in AppStatusStore uses
-    // `executorRunTime` to detect valid tasks, so that metric needs to be updated in the
-    // task end event.
-    time += 1
-    val task = createTasks(1, Array("1")).head
-    listener.onTaskStart(SparkListenerTaskStart(dropped.stageId, dropped.attemptId, task))
+      tasks.foreach { t =>
+        kvstore.delete(t.getClass(), t.taskId)
+      }
 
-    time += 1
-    task.markFinished(TaskState.FINISHED, time)
-    val metrics = TaskMetrics.empty
-    metrics.setExecutorRunTime(42L)
-    listener.onTaskEnd(SparkListenerTaskEnd(dropped.stageId, dropped.attemptId,
-      "taskType", Success, task, metrics))
+      // Check whether there are remaining attempts for the same stage. If there aren't, then
+      // also delete the RDD graph data.
+      val remainingAttempts = kvstore.view(classOf[StageDataWrapper])
+        .index("stageId")
+        .first(s.info.stageId)
+        .last(s.info.stageId)
+        .closeableIterator()
 
-    new AppStatusStore(store)
-      .taskSummary(dropped.stageId, dropped.attemptId, Array(0.25d, 0.50d, 0.75d))
-    assert(store.count(classOf[CachedQuantile], "stage", key(dropped)) === 3)
+      val hasMoreAttempts = try {
+        remainingAttempts.asScala.exists { other =>
+          other.info.attemptId != s.info.attemptId
+        }
+      } finally {
+        remainingAttempts.close()
+      }
 
-    stages.drop(1).foreach { s =>
-      time += 1
-      s.completionTime = Some(time)
-      listener.onStageCompleted(SparkListenerStageCompleted(s))
-    }
+      if (!hasMoreAttempts) {
+        kvstore.delete(classOf[RDDOperationGraphWrapper], s.info.stageId)
+      }
 
-    assert(store.count(classOf[StageDataWrapper]) === 2)
-    assert(store.count(classOf[RDDOperationGraphWrapper]) === 2)
-    intercept[NoSuchElementException] {
-      store.read(classOf[StageDataWrapper], Array(2, 0))
-    }
-    assert(store.count(classOf[CachedQuantile], "stage", key(dropped)) === 0)
-
-    val attempt2 = new StageInfo(3, 1, "stage3", 4, Nil, Nil, "details3")
-    time += 1
-    attempt2.submissionTime = Some(time)
-    listener.onStageSubmitted(SparkListenerStageSubmitted(attempt2, new Properties()))
-
-    assert(store.count(classOf[StageDataWrapper]) === 2)
-    assert(store.count(classOf[RDDOperationGraphWrapper]) === 2)
-    intercept[NoSuchElementException] {
-      store.read(classOf[StageDataWrapper], Array(2, 0))
-    }
-    intercept[NoSuchElementException] {
-      store.read(classOf[StageDataWrapper], Array(3, 0))
-    }
-    store.read(classOf[StageDataWrapper], Array(3, 1))
-
-    // Start 2 tasks. Finish the second one.
-    time += 1
-    val tasks = createTasks(2, Array("1"))
-    tasks.foreach { task =>
-      listener.onTaskStart(SparkListenerTaskStart(attempt2.stageId, attempt2.attemptNumber, task))
-    }
-    assert(store.count(classOf[TaskDataWrapper]) === 2)
-
-    // Start a 3rd task. The finished tasks should be deleted.
-    createTasks(1, Array("1")).foreach { task =>
-      listener.onTaskStart(SparkListenerTaskStart(attempt2.stageId, attempt2.attemptNumber, task))
-    }
-    assert(store.count(classOf[TaskDataWrapper]) === 2)
-    intercept[NoSuchElementException] {
-      store.read(classOf[TaskDataWrapper], tasks.last.id)
-    }
-
-    // Start a 4th task. The first task should be deleted, even if it's still running.
-    createTasks(1, Array("1")).foreach { task =>
-      listener.onTaskStart(SparkListenerTaskStart(attempt2.stageId, attempt2.attemptNumber, task))
-    }
-    assert(store.count(classOf[TaskDataWrapper]) === 2)
-    intercept[NoSuchElementException] {
-      store.read(classOf[TaskDataWrapper], tasks.head.id)
+      cleanupCachedQuantiles(key)
     }
   }
 
-  test("eviction should respect job completion time") {
-    val testConf = conf.clone().set(MAX_RETAINED_JOBS, 2)
-    val listener = new AppStatusListener(store, testConf, true)
+  private def cleanupTasks(stage: LiveStage): Unit = {
+    val countToDelete = calculateNumberToRemove(stage.savedTasks.get(), maxTasksPerStage).toInt
+    if (countToDelete > 0) {
+      val stageKey = Array(stage.info.stageId, stage.info.attemptNumber)
+      val view = kvstore.view(classOf[TaskDataWrapper])
+        .index(TaskIndexNames.COMPLETION_TIME)
+        .parent(stageKey)
 
-    // Start job 1 and job 2
-    time += 1
-    listener.onJobStart(SparkListenerJobStart(1, time, Nil, null))
-    time += 1
-    listener.onJobStart(SparkListenerJobStart(2, time, Nil, null))
+      // Try to delete finished tasks only.
+      val toDelete = KVUtils.viewToSeq(view, countToDelete) { t =>
+        !live || t.status != TaskState.RUNNING.toString()
+      }
+      toDelete.foreach { t => kvstore.delete(t.getClass(), t.taskId) }
+      stage.savedTasks.addAndGet(-toDelete.size)
 
-    // Stop job 2 before job 1
-    time += 1
-    listener.onJobEnd(SparkListenerJobEnd(2, time, JobSucceeded))
-    time += 1
-    listener.onJobEnd(SparkListenerJobEnd(1, time, JobSucceeded))
+      // If there are more running tasks than the configured limit, delete running tasks. This
+      // should be extremely rare since the limit should generally far exceed the number of tasks
+      // that can run in parallel.
+      val remaining = countToDelete - toDelete.size
+      if (remaining > 0) {
+        val runningTasksToDelete = view.max(remaining).iterator().asScala.toList
+        runningTasksToDelete.foreach { t => kvstore.delete(t.getClass(), t.taskId) }
+        stage.savedTasks.addAndGet(-remaining)
+      }
 
-    // Start job 3 and job 2 should be evicted.
-    time += 1
-    listener.onJobStart(SparkListenerJobStart(3, time, Nil, null))
-    assert(store.count(classOf[JobDataWrapper]) === 2)
-    intercept[NoSuchElementException] {
-      store.read(classOf[JobDataWrapper], 2)
+      // On live applications, cleanup any cached quantiles for the stage. This makes sure that
+      // quantiles will be recalculated after tasks are replaced with newer ones.
+      //
+      // This is not needed in the SHS since caching only happens after the event logs are
+      // completely processed.
+      if (live) {
+        cleanupCachedQuantiles(stageKey)
+      }
+    }
+    stage.cleaning = false
+  }
+
+  private def cleanupCachedQuantiles(stageKey: Array[Int]): Unit = {
+    val cachedQuantiles = kvstore.view(classOf[CachedQuantile])
+      .index("stage")
+      .first(stageKey)
+      .last(stageKey)
+      .asScala
+      .toList
+    cachedQuantiles.foreach { q =>
+      kvstore.delete(q.getClass(), q.id)
     }
   }
 
-  test("eviction should respect stage completion time") {
-    val testConf = conf.clone().set(MAX_RETAINED_STAGES, 2)
-    val listener = new AppStatusListener(store, testConf, true)
-
-    val stage1 = new StageInfo(1, 0, "stage1", 4, Nil, Nil, "details1")
-    val stage2 = new StageInfo(2, 0, "stage2", 4, Nil, Nil, "details2")
-    val stage3 = new StageInfo(3, 0, "stage3", 4, Nil, Nil, "details3")
-
-    // Start stage 1 and stage 2
-    time += 1
-    stage1.submissionTime = Some(time)
-    listener.onStageSubmitted(SparkListenerStageSubmitted(stage1, new Properties()))
-    time += 1
-    stage2.submissionTime = Some(time)
-    listener.onStageSubmitted(SparkListenerStageSubmitted(stage2, new Properties()))
-
-    // Stop stage 2 before stage 1
-    time += 1
-    stage2.completionTime = Some(time)
-    listener.onStageCompleted(SparkListenerStageCompleted(stage2))
-    time += 1
-    stage1.completionTime = Some(time)
-    listener.onStageCompleted(SparkListenerStageCompleted(stage1))
-
-    // Start stage 3 and stage 2 should be evicted.
-    stage3.submissionTime = Some(time)
-    listener.onStageSubmitted(SparkListenerStageSubmitted(stage3, new Properties()))
-    assert(store.count(classOf[StageDataWrapper]) === 2)
-    intercept[NoSuchElementException] {
-      store.read(classOf[StageDataWrapper], Array(2, 0))
+  /**
+   * Remove at least (retainedSize / 10) items to reduce friction. Because tracking may be done
+   * asynchronously, this method may return 0 in case enough items have been deleted already.
+   */
+  private def calculateNumberToRemove(dataSize: Long, retainedSize: Long): Long = {
+    if (dataSize > retainedSize) {
+      math.max(retainedSize / 10L, dataSize - retainedSize)
+    } else {
+      0L
     }
-  }
-
-  test("skipped stages should be evicted before completed stages") {
-    val testConf = conf.clone().set(MAX_RETAINED_STAGES, 2)
-    val listener = new AppStatusListener(store, testConf, true)
-
-    val stage1 = new StageInfo(1, 0, "stage1", 4, Nil, Nil, "details1")
-    val stage2 = new StageInfo(2, 0, "stage2", 4, Nil, Nil, "details2")
-
-    // Sart job 1
-    time += 1
-    listener.onJobStart(SparkListenerJobStart(1, time, Seq(stage1, stage2), null))
-
-    // Start and stop stage 1
-    time += 1
-    stage1.submissionTime = Some(time)
-    listener.onStageSubmitted(SparkListenerStageSubmitted(stage1, new Properties()))
-
-    time += 1
-    stage1.completionTime = Some(time)
-    listener.onStageCompleted(SparkListenerStageCompleted(stage1))
-
-    // Stop job 1 and stage 2 will become SKIPPED
-    time += 1
-    listener.onJobEnd(SparkListenerJobEnd(1, time, JobSucceeded))
-
-    // Submit stage 3 and verify stage 2 is evicted
-    val stage3 = new StageInfo(3, 0, "stage3", 4, Nil, Nil, "details3")
-    time += 1
-    stage3.submissionTime = Some(time)
-    listener.onStageSubmitted(SparkListenerStageSubmitted(stage3, new Properties()))
-
-    assert(store.count(classOf[StageDataWrapper]) === 2)
-    intercept[NoSuchElementException] {
-      store.read(classOf[StageDataWrapper], Array(2, 0))
-    }
-  }
-
-  test("eviction should respect task completion time") {
-    val testConf = conf.clone().set(MAX_RETAINED_TASKS_PER_STAGE, 2)
-    val listener = new AppStatusListener(store, testConf, true)
-
-    val stage1 = new StageInfo(1, 0, "stage1", 4, Nil, Nil, "details1")
-    stage1.submissionTime = Some(time)
-    listener.onStageSubmitted(SparkListenerStageSubmitted(stage1, new Properties()))
-
-    // Start task 1 and task 2
-    val tasks = createTasks(3, Array("1"))
-    tasks.take(2).foreach { task =>
-      listener.onTaskStart(SparkListenerTaskStart(stage1.stageId, stage1.attemptNumber, task))
-    }
-
-    // Stop task 2 before task 1
-    time += 1
-    tasks(1).markFinished(TaskState.FINISHED, time)
-    listener.onTaskEnd(
-      SparkListenerTaskEnd(stage1.stageId, stage1.attemptId, "taskType", Success, tasks(1), null))
-    time += 1
-    tasks(0).markFinished(TaskState.FINISHED, time)
-    listener.onTaskEnd(
-      SparkListenerTaskEnd(stage1.stageId, stage1.attemptId, "taskType", Success, tasks(0), null))
-
-    // Start task 3 and task 2 should be evicted.
-    listener.onTaskStart(SparkListenerTaskStart(stage1.stageId, stage1.attemptNumber, tasks(2)))
-    assert(store.count(classOf[TaskDataWrapper]) === 2)
-    intercept[NoSuchElementException] {
-      store.read(classOf[TaskDataWrapper], tasks(1).id)
-    }
-  }
-
-  test("lastStageAttempt should fail when the stage doesn't exist") {
-    val testConf = conf.clone().set(MAX_RETAINED_STAGES, 1)
-    val listener = new AppStatusListener(store, testConf, true)
-    val appStore = new AppStatusStore(store)
-
-    val stage1 = new StageInfo(1, 0, "stage1", 4, Nil, Nil, "details1")
-    val stage2 = new StageInfo(2, 0, "stage2", 4, Nil, Nil, "details2")
-    val stage3 = new StageInfo(3, 0, "stage3", 4, Nil, Nil, "details3")
-
-    time += 1
-    stage1.submissionTime = Some(time)
-    listener.onStageSubmitted(SparkListenerStageSubmitted(stage1, new Properties()))
-    stage1.completionTime = Some(time)
-    listener.onStageCompleted(SparkListenerStageCompleted(stage1))
-
-    // Make stage 3 complete before stage 2 so that stage 3 will be evicted
-    time += 1
-    stage3.submissionTime = Some(time)
-    listener.onStageSubmitted(SparkListenerStageSubmitted(stage3, new Properties()))
-    stage3.completionTime = Some(time)
-    listener.onStageCompleted(SparkListenerStageCompleted(stage3))
-
-    time += 1
-    stage2.submissionTime = Some(time)
-    listener.onStageSubmitted(SparkListenerStageSubmitted(stage2, new Properties()))
-    stage2.completionTime = Some(time)
-    listener.onStageCompleted(SparkListenerStageCompleted(stage2))
-
-    assert(appStore.asOption(appStore.lastStageAttempt(1)) === None)
-    assert(appStore.asOption(appStore.lastStageAttempt(2)).map(_.stageId) === Some(2))
-    assert(appStore.asOption(appStore.lastStageAttempt(3)) === None)
-  }
-
-  test("driver logs") {
-    val listener = new AppStatusListener(store, conf, true)
-
-    val driver = BlockManagerId(SparkContext.DRIVER_IDENTIFIER, "localhost", 42)
-    listener.onBlockManagerAdded(SparkListenerBlockManagerAdded(time, driver, 42L))
-    listener.onApplicationStart(SparkListenerApplicationStart(
-      "name",
-      Some("id"),
-      time,
-      "user",
-      Some("attempt"),
-      Some(Map("stdout" -> "file.txt"))))
-
-    check[ExecutorSummaryWrapper](SparkContext.DRIVER_IDENTIFIER) { d =>
-      assert(d.info.executorLogs("stdout") === "file.txt")
-    }
-  }
-
-  private def key(stage: StageInfo): Array[Int] = Array(stage.stageId, stage.attemptNumber)
-
-  private def check[T: ClassTag](key: Any)(fn: T => Unit): Unit = {
-    val value = store.read(classTag[T].runtimeClass, key).asInstanceOf[T]
-    fn(value)
-  }
-
-  private def newAttempt(orig: TaskInfo, nextId: Long): TaskInfo = {
-    // Task reattempts have a different ID, but the same index as the original.
-    new TaskInfo(nextId, orig.index, orig.attemptNumber + 1, time, orig.executorId,
-      s"${orig.executorId}.example.com", TaskLocality.PROCESS_LOCAL, orig.speculative)
-  }
-
-  private def createTasks(count: Int, execs: Array[String]): Seq[TaskInfo] = {
-    (1 to count).map { id =>
-      val exec = execs(id.toInt % execs.length)
-      val taskId = nextTaskId()
-      new TaskInfo(taskId, taskId.toInt, 1, time, exec, s"$exec.example.com",
-        TaskLocality.PROCESS_LOCAL, id % 2 == 0)
-    }
-  }
-
-  private def nextTaskId(): Long = {
-    taskIdTracker += 1
-    taskIdTracker
-  }
-
-  private case class RddBlock(
-      rddId: Int,
-      partId: Int,
-      memSize: Long,
-      diskSize: Long) {
-
-    def blockId: BlockId = RDDBlockId(rddId, partId)
-
   }
 
 }
