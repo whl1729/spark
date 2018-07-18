@@ -146,7 +146,24 @@ case class SparkListenerBlockUpdated(blockUpdatedInfo: BlockUpdatedInfo) extends
 @DeveloperApi
 case class SparkListenerExecutorMetricsUpdate(
     execId: String,
-    accumUpdates: Seq[(Long, Int, Int, Seq[AccumulableInfo])])
+    accumUpdates: Seq[(Long, Int, Int, Seq[AccumulableInfo])],
+    executorUpdates: Option[Array[Long]] = None)
+  extends SparkListenerEvent
+
+/**
++ * Peak metric values for the executor for the stage, written to the history log at stage
++ * completion.
++ * @param execId executor id
++ * @param stageId stage id
++ * @param stageAttemptId stage attempt
++ * @param executorMetrics executor level metrics
++ */
+@DeveloperApi
+case class SparkListenerStageExecutorMetrics(
+    execId: String,
+    stageId: Int,
+    stageAttemptId: Int,
+    executorMetrics: Array[Long])
   extends SparkListenerEvent
 
 @DeveloperApi
@@ -247,6 +264,12 @@ private[spark] trait SparkListenerInterface {
   def onExecutorMetricsUpdate(executorMetricsUpdate: SparkListenerExecutorMetricsUpdate): Unit
 
   /**
++   * Called when the driver reads stage executor metrics from the history log.
++   */
+  def onStageExecutorMetrics(executorMetrics: SparkListenerStageExecutorMetrics): Unit
+
+
+  /**
    * Called when the driver registers a new executor.
    */
   def onExecutorAdded(executorAdded: SparkListenerExecutorAdded): Unit
@@ -331,6 +354,8 @@ abstract class SparkListener extends SparkListenerInterface {
 
   override def onExecutorMetricsUpdate(
       executorMetricsUpdate: SparkListenerExecutorMetricsUpdate): Unit = { }
+
+  override def onStageExecutorMetrics(executorMetrics: SparkListenerStageExecutorMetrics): Unit = { }
 
   override def onExecutorAdded(executorAdded: SparkListenerExecutorAdded): Unit = { }
 
