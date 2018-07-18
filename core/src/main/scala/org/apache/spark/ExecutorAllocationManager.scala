@@ -470,7 +470,7 @@ private[spark] class ExecutorAllocationManager(
     val dontSize = dontRemove.size
 
     logInfo(s"[along]removeExecutors: numExistingExecs=$numExistingExecs, execCountFloor=$execCountFloor, " +
-      s"minNumExecutors=$minNumExecutors, numExecutorsTarget=$numExecutorsTarget." + 
+      s"minNumExecutors=$minNumExecutors, numExecutorsTarget=$numExecutorsTarget, " + 
       s"executorIdsToBeRemoved.size=$removeSize, dontRemove.size=$dontSize.")
 
     // if (log.isDebugEnabled()) {

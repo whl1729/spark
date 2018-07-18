@@ -75,7 +75,8 @@ private[spark] trait TaskScheduler {
   def executorHeartbeatReceived(
       execId: String,
       accumUpdates: Array[(Long, Seq[AccumulatorV2[_, _]])],
-      blockManagerId: BlockManagerId): Boolean
+      blockManagerId: BlockManagerId,
+      executorUpdates: Array[Long]): Boolean
 
   /**
    * Get an application ID associated with the job.
