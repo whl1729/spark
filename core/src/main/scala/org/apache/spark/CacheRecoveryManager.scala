@@ -9,73 +9,70 @@
  *    http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+ * WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.  See the
+ * License for the specific language governing permissions and limitations
+ * under the License.
  */
 
 package org.apache.spark
 
 import java.util.concurrent.TimeUnit
 
-import scala.collection.JavaConverters._
-import scala.concurrent.{ExecutionContext, Future, Promise}
-import scala.util.Failure
+import scala.collection.JavaConverters._ import
+scala.concurrent.{ExecutionContext, Future, Promise} import scala.util.Failure
 
 import com.google.common.cache.CacheBuilder
 
-import org.apache.spark.CacheRecoveryManager.{DoneRecovering, KillReason, Timeout}
-import org.apache.spark.internal.Logging
-import org.apache.spark.internal.config.DYN_ALLOCATION_CACHE_RECOVERY_TIMEOUT
-import org.apache.spark.rpc.RpcEndpointRef
-import org.apache.spark.storage.BlockManagerId
-import org.apache.spark.storage.BlockManagerMessages._
-import org.apache.spark.util.ThreadUtils
+import org.apache.spark.CacheRecoveryManager.{DoneRecovering, KillReason,
+Timeout} import org.apache.spark.internal.Logging import
+org.apache.spark.internal.config.DYN_ALLOCATION_CACHE_RECOVERY_TIMEOUT import
+org.apache.spark.rpc.RpcEndpointRef import
+org.apache.spark.storage.BlockManagerId import
+org.apache.spark.storage.BlockManagerMessages._ import
+org.apache.spark.util.ThreadUtils
 
 /**
- * Responsible for asynchronously replicating all of an executor's cached blocks, and then shutting
- * it down.
+ * Responsible for asynchronously replicating all of an executor's cached
+ * blocks, and then shutting it down.
  */
-private class CacheRecoveryManager(
-    blockManagerMasterEndpoint: RpcEndpointRef,
-    executorAllocationManager: ExecutorAllocationManager,
-    conf: SparkConf)
-  extends Logging {
+private class CacheRecoveryManager( blockManagerMasterEndpoint: RpcEndpointRef,
+  executorAllocationManager: ExecutorAllocationManager, conf: SparkConf)
+extends Logging {
 
   private val forceKillAfterS = conf.get(DYN_ALLOCATION_CACHE_RECOVERY_TIMEOUT)
-  private val threadPool = ThreadUtils.newDaemonCachedThreadPool("cache-recovery-manager-pool")
-  private implicit val asyncExecutionContext = ExecutionContext.fromExecutorService(threadPool)
-  private val scheduler =
-    ThreadUtils.newDaemonSingleThreadScheduledExecutor("cache-recovery-shutdown-timers")
-  private val recoveringExecutors = CacheBuilder.newBuilder()
-    .expireAfterWrite(forceKillAfterS * 2, TimeUnit.SECONDS)
-    .build[String, String]()
+  private val threadPool =
+    ThreadUtils.newDaemonCachedThreadPool("cache-recovery-manager-pool")
+    private implicit val asyncExecutionContext =
+      ExecutionContext.fromExecutorService(threadPool) private val scheduler =
+        ThreadUtils.newDaemonSingleThreadScheduledExecutor("cache-recovery-shutdown-timers")
+        private val recoveringExecutors = CacheBuilder.newBuilder()
+          .expireAfterWrite(forceKillAfterS * 2, TimeUnit.SECONDS)
+          .build[String, String]()
 
   /**
    * Start the recover cache shutdown process for these executors
    *
-   * @param execIds the executors to start shutting down
-   * @return a sequence of futures of Unit that will complete once the executor has been killed.
+   * @param execIds the executors to start shutting down @return a sequence of
+   * futures of Unit that will complete once the executor has been killed.
    */
   def startCacheRecovery(execIds: Seq[String]): Future[Seq[KillReason]] = {
-    logDebug(s"[along]startCacheRecovery: Recover cached data before shutting down executors ${execIds.mkString(", ")}.")
-    val canBeRecovered: Future[Seq[String]] = checkMem(execIds)
+    logDebug(s"[along]startCacheRecovery: Recover cached data before shutting
+      down executors ${execIds.mkString(", ")}.") val canBeRecovered:
+    Future[Seq[String]] = checkMem(execIds)
 
-    canBeRecovered.flatMap { execIds =>
-      execIds.foreach { execId => recoveringExecutors.put(execId, execId) }
-      execIds.foreach { execId => logInfo(s"[along]startCacheRecovery: executor $execId can be recovered.") }
-      Future.sequence(execIds.map { replicateUntilTimeoutThenKill })
-    }
-  }
+    canBeRecovered.flatMap { execIds => execIds.foreach { execId =>
+    recoveringExecutors.put(execId, execId) } execIds.foreach { execId =>
+    logInfo(s"[along]startCacheRecovery: executor $execId can be recovered.") }
+    Future.sequence(execIds.map { replicateUntilTimeoutThenKill }) } }
 
-  def replicateUntilTimeoutThenKill(execId: String): Future[KillReason] = {
-    val timeoutFuture = returnAfterTimeout(Timeout, forceKillAfterS)
-    val replicationFuture = replicateUntilDone(execId)
+  def replicateUntilTimeoutThenKill(execId: String): Future[KillReason] = { val
+    timeoutFuture = returnAfterTimeout(Timeout, forceKillAfterS) val
+    replicationFuture = replicateUntilDone(execId)
 
     Future.firstCompletedOf(List(timeoutFuture, replicationFuture)).andThen {
-      case scala.util.Success(DoneRecovering) =>
-        logTrace(s"Done recovering blocks on $execId, killing now")
+      case scala.util.Success(DoneRecovering) => logTrace(s"Done recovering
+        blocks on $execId, killing now")
       case scala.util.Success(Timeout) =>
         logWarning(s"Couldn't recover cache on $execId before $forceKillAfterS second timeout")
       case Failure(ex) =>
