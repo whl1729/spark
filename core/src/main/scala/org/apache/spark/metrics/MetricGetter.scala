@@ -14,29 +14,27 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
 package org.apache.spark.metrics
 
-import java.lang.management.{BufferPoolMXBean, ManagementFactory, _}
+import java.lang.management.{BufferPoolMXBean, ManagementFactory}
 import javax.management.ObjectName
 
 import org.apache.spark.memory.MemoryManager
 
-sealed trait MetricGetter {
+private[spark] sealed trait MetricGetter {
   def getMetricValue(memoryManager: MemoryManager): Long
   val name = getClass().getName().stripSuffix("$").split("""\.""").last
-    
-  def getMetricValue1(): Long
-  val name1 = getClass().getName().stripSuffix("$").split("""\.""").last
 }
 
-abstract class MemoryManagerMetricGetter(f: MemoryManager => Long) extends MetricGetter {
+private[spark] abstract class MemoryManagerMetricGetter(
+    f: MemoryManager => Long) extends MetricGetter {
   override def getMetricValue(memoryManager: MemoryManager): Long = {
     f(memoryManager)
   }
 }
 
-abstract class MBeanMetricGetter(mBeanName: String) extends MetricGetter {
+private[spark]abstract class MBeanMetricGetter(mBeanName: String)
+  extends MetricGetter {
   val bean = ManagementFactory.newPlatformMXBeanProxy(ManagementFactory.getPlatformMBeanServer,
     new ObjectName(mBeanName).toString, classOf[BufferPoolMXBean])
 
@@ -44,48 +42,43 @@ abstract class MBeanMetricGetter(mBeanName: String) extends MetricGetter {
     bean.getMemoryUsed
   }
 }
-//donglin
-abstract class MBeanMetricGetter1(mBeanName: String) extends MetricGetter {
-  val bean = ManagementFactory.newPlatformMXBeanProxy(ManagementFactory.getPlatformMBeanServer,
-    new ObjectName(mBeanName).toString, classOf[BufferPoolMXBean])
 
-  override def getMetricValue1(): Long = {
-    bean.getName
-  }
-}
-
-case object JVMHeapMemory extends MetricGetter {
+private[spark] case object JVMHeapMemory extends MetricGetter {
   override def getMetricValue(memoryManager: MemoryManager): Long = {
     ManagementFactory.getMemoryMXBean.getHeapMemoryUsage().getUsed()
   }
 }
 
-case object JVMOffHeapMemory extends MetricGetter {
+private[spark] case object JVMOffHeapMemory extends MetricGetter {
   override def getMetricValue(memoryManager: MemoryManager): Long = {
     ManagementFactory.getMemoryMXBean.getNonHeapMemoryUsage().getUsed()
   }
 }
 
-case object OnHeapExecutionMemory extends MemoryManagerMetricGetter(_.onHeapExecutionMemoryUsed)
+private[spark] case object OnHeapExecutionMemory extends MemoryManagerMetricGetter(
+  _.onHeapExecutionMemoryUsed)
 
-case object OffHeapExecutionMemory extends MemoryManagerMetricGetter(_.offHeapExecutionMemoryUsed)
+private[spark] case object OffHeapExecutionMemory extends MemoryManagerMetricGetter(
+  _.offHeapExecutionMemoryUsed)
 
-case object OnHeapStorageMemory extends MemoryManagerMetricGetter(_.onHeapStorageMemoryUsed)
+private[spark] case object OnHeapStorageMemory extends MemoryManagerMetricGetter(
+  _.onHeapStorageMemoryUsed)
 
-case object OffHeapStorageMemory extends MemoryManagerMetricGetter(_.offHeapStorageMemoryUsed)
+private[spark] case object OffHeapStorageMemory extends MemoryManagerMetricGetter(
+  _.offHeapStorageMemoryUsed)
 
-case object OnHeapUnifiedMemory extends MemoryManagerMetricGetter(
+private[spark] case object OnHeapUnifiedMemory extends MemoryManagerMetricGetter(
   (m => m.onHeapExecutionMemoryUsed + m.onHeapStorageMemoryUsed))
 
-case object OffHeapUnifiedMemory extends MemoryManagerMetricGetter(
+private[spark] case object OffHeapUnifiedMemory extends MemoryManagerMetricGetter(
   (m => m.offHeapExecutionMemoryUsed + m.offHeapStorageMemoryUsed))
 
-case object DirectPoolMemory extends MBeanMetricGetter("java.nio:type=BufferPool,name=direct")
-case object MappedPoolMemory extends MBeanMetricGetter("java.nio:type=BufferPool,name=mapped")
+private[spark] case object DirectPoolMemory extends MBeanMetricGetter(
+  "java.nio:type=BufferPool,name=direct")
+private[spark] case object MappedPoolMemory extends MBeanMetricGetter(
+  "java.nio:type=BufferPool,name=mapped")
 
-case object JVMCPUTime extends MBeanMetricGetter1("java.lang:type=OperatingSystem,name=ProcessCpuLoad")
-
-object MetricGetter {
+private[spark] object MetricGetter {
   val values = IndexedSeq(
     JVMHeapMemory,
     JVMOffHeapMemory,
@@ -96,8 +89,7 @@ object MetricGetter {
     OnHeapUnifiedMemory,
     OffHeapUnifiedMemory,
     DirectPoolMemory,
-    MappedPoolMemory,
-    JVMCPUTime
+    MappedPoolMemory
   )
 
   val idxAndValues = values.zipWithIndex.map(_.swap)
