@@ -2416,7 +2416,7 @@ class SparkContext(config: SparkConf) extends Logging {
     }
   }
 
-  private def printTimes = 0
+  private var printTimes = 0
 
   /** donglin Reports heartbeat metrics for the driver. */
   private def reportHeartBeat(): Unit = {
@@ -2432,7 +2432,7 @@ class SparkContext(config: SparkConf) extends Logging {
       }
     }
 
-    printTimes += 1
+    printTimes = printTimes + 1
 
     val accumUpdates = new Array[(Long, Int, Int, Seq[AccumulableInfo])](0)
     listenerBus.post(SparkListenerExecutorMetricsUpdate("driver", accumUpdates,
