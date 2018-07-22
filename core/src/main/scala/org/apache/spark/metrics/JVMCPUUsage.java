@@ -42,7 +42,8 @@ public class JVMCPUUsage {
     private long prevJvmUptime = 0;
     private long curJvmProcessCpuTime = 0;
     private long curJvmUptime = 0;
-    private boolean isConnect = false;
+    private boolean isInitialize = false;
+//    private boolean isConnect = false;
     
     // initiate and prepare MBeanServerConnection
     public void openMBeanServerConnection() throws IOException {
@@ -79,19 +80,23 @@ public class JVMCPUUsage {
 
     // along: record previous cpuTime and upTime
     public void startCalcJvmCpuUsage() {
-        if (!isConnect) {
-            System.out.println("[along]connect to MBean server and MXBean proxy.");
-
-            try {
-                openMBeanServerConnection();
-                getMXBeanProxyConnections();
-            }
-            catch(IOException e) {
-                e.printStackTrace();
-            }
-
-            isConnect = true;
+        if (!isInitialize) {
+            peOperatingSystemMXBean = (com.sun.management.OperatingSystemMXBean)ManagementFactory.getOperatingSystemMXBean();
+            runtimeMXBean = ManagementFactory.getRuntimeMXBean();
         }
+//        if (!isConnect) {
+//            System.out.println("[along]connect to MBean server and MXBean proxy.");
+//
+//            try {
+//                openMBeanServerConnection();
+//                getMXBeanProxyConnections();
+//            }
+//            catch(IOException e) {
+//                e.printStackTrace();
+//            }
+//
+//            isConnect = true;
+//        }
 
         // set old timestamp values
         prevJvmProcessCpuTime = peOperatingSystemMXBean.getProcessCpuTime();

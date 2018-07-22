@@ -2423,7 +2423,7 @@ class SparkContext(config: SparkConf) extends Logging {
     val driverUpdates = _heartbeater.getCurrentMetrics()
     val metricsNum = driverUpdates.length
 
-    if (printTimes < 10) {
+    if (printTimes < 5) {
       logInfo(s"[along]$printTimes. there are $metricsNum metrics data: ")
 
       for (pos <- 0 to (metricsNum - 1)) {
