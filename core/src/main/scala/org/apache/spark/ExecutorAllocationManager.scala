@@ -28,6 +28,7 @@ import com.codahale.metrics.{Gauge, MetricRegistry}
 import org.apache.spark.internal.Logging
 import org.apache.spark.internal.config._
 import org.apache.spark.metrics.source.Source
+import org.apache.spark.metrics.JVMCPUUsage
 import org.apache.spark.scheduler._
 import org.apache.spark.storage.BlockManagerMaster
 import org.apache.spark.util.{Clock, SystemClock, ThreadUtils, Utils}
@@ -147,6 +148,8 @@ private[spark] class ExecutorAllocationManager(
   // This is set when an executor is no longer running a task, or when it first registers
   private val removeTimes = new mutable.HashMap[String, Long]
 
+  val jvmCpuUsage = new JVMCPUUsage
+   
   // Polling loop interval (ms)
   private val intervalMillis: Long = if (Utils.isTesting) {
       conf.getLong(TESTING_SCHEDULE_INTERVAL_KEY, 100)
@@ -664,6 +667,7 @@ private[spark] class ExecutorAllocationManager(
     private val stageIdToExecutorPlacementHints = new mutable.HashMap[Int, (Int, Map[String, Int])]
 
     override def onStageSubmitted(stageSubmitted: SparkListenerStageSubmitted): Unit = {
+      logInfo(s"[along]onStageSubmitted...")
       initializing = false
       val stageId = stageSubmitted.stageInfo.stageId
       val numTasks = stageSubmitted.stageInfo.numTasks
@@ -690,9 +694,13 @@ private[spark] class ExecutorAllocationManager(
         // Update the executor placement hints
         updateExecutorPlacementHints()
       }
+
+      logInfo(s"[along]start calculating cpu usage.")
+      jvmCpuUsage.startCalcJvmCpuUsage()
     }
 
     override def onStageCompleted(stageCompleted: SparkListenerStageCompleted): Unit = {
+      logInfo(s"[along]onStageCompleted...")
       val stageId = stageCompleted.stageInfo.stageId
       allocationManager.synchronized {
         stageIdToNumTasks -= stageId
@@ -728,6 +736,10 @@ private[spark] class ExecutorAllocationManager(
         }
 
       }
+
+      val usage = jvmCpuUsage.getJvmCpuUsage()
+
+      logInfo(s"[along]stop calculating cpu usage. cpuUsage=$usage")
     }
 
     override def onTaskStart(taskStart: SparkListenerTaskStart): Unit = {

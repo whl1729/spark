@@ -42,7 +42,8 @@ public class JVMCPUUsage {
     private long prevJvmUptime = 0;
     private long curJvmProcessCpuTime = 0;
     private long curJvmUptime = 0;
-
+    private boolean isConnect = false;
+    
     // initiate and prepare MBeanServerConnection
     public void openMBeanServerConnection() throws IOException {
         // initiate address of the JMX API connector server
@@ -78,11 +79,18 @@ public class JVMCPUUsage {
 
     // along: record previous cpuTime and upTime
     public void startCalcJvmCpuUsage() {
+        if (!isConnect) {
+            System.out.println("[along]connect to MBean server and MXBean proxy.");
+
+            openMBeanServerConnection();
+            getMXBeanProxyConnections();
+        }
+
         // set old timestamp values
         prevJvmProcessCpuTime = peOperatingSystemMXBean.getProcessCpuTime();
         prevJvmUptime = runtimeMXBean.getUptime();
 
-        System.out.println("[along]startCalcCpuUsage: prevCpuTime=%dns, prevUpTime=%dms.", prevJvmProcessCpuTime, prevJvmUptime);
+        System.out.printf("[along]startCalcCpuUsage: prevCpuTime=%dns, prevUpTime=%dms.", prevJvmProcessCpuTime, prevJvmUptime);
     }
 
     // Get JVM CPU usage
@@ -102,12 +110,12 @@ public class JVMCPUUsage {
         // to convert nanoseconds to milliseconds divide it by 1000000 and to get a percentage multiply it by 100
         float cpuUsage = elapsedProcessCpuTime / (totalElapsedJvmUptime * 10000F);
 
-        System.out.println("[along]getJvmCpuUsage: ");
-        System.out.println("[along]prevCpuTime=%dns, curCpuTime=%dns, elapsedCpuTime=%dns.",
+        System.out.printf("[along]getJvmCpuUsage: ");
+        System.out.printf("[along]prevCpuTime=%dns, curCpuTime=%dns, elapsedCpuTime=%dns.",
             prevJvmProcessCpuTime, curJvmProcessCpuTime, elapsedProcessCpuTime);
-        System.out.println("[along]prevUpTime=%dms, curUpTime=%dms, elapsedUpTime=%dms.",
+        System.out.printf("[along]prevUpTime=%dms, curUpTime=%dms, elapsedUpTime=%dms.",
             prevJvmUptime, curJvmUptime, elapsedJvmUptime);
-        System.out.println("[along]cpuUsage=%f.", cpuUsage);
+        System.out.printf("[along]cpuUsage=%f.", cpuUsage);
 
         return cpuUsage;
     }
