@@ -142,14 +142,12 @@ private[spark] class EventLoggingListener(
         throw e
     }
 
-    logInfo("[along]JVMCPUUsage initialize start.");
+    logInfo("[along]JVMCPUUsage initialize start.")
 
-    jvmCpuUsage.openMBeanServerConnection();
-    jvmCpuUsage.getMXBeanProxyConnections();
+    jvmCpuUsage.openMBeanServerConnection()
+    jvmCpuUsage.getMXBeanProxyConnections()
 
-    logInfo("[along]JVMCPUUsage initialize end.");
-    }
-
+    logInfo("[along]JVMCPUUsage initialize end.")
   }
 
   /** Log the event as JSON. */
