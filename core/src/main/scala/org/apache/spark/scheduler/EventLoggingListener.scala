@@ -40,6 +40,7 @@ import org.apache.spark.internal.Logging
 import org.apache.spark.internal.config._
 import org.apache.spark.io.CompressionCodec
 import org.apache.spark.util.{JsonProtocol, Utils}
+import org.apache.spark.metrics.JVMCPUUsage
 
 /**
  * A SparkListener that logs events to persistent storage.
@@ -96,6 +97,9 @@ private[spark] class EventLoggingListener(
   
   // map of (stageId, stageAttempt), to peak executor metrics for the stage
   private val liveStageExecutorMetrics = HashMap[(Int, Int), HashMap[String, PeakExecutorMetrics]]()
+
+  val jvmCpuUsage = new JVMCPUUsage
+   
   /**
    * Creates the log file in the configured log directory.
    */
@@ -164,6 +168,8 @@ private[spark] class EventLoggingListener(
       // record the peak metrics for the new stage
       liveStageExecutorMetrics.put((event.stageInfo.stageId, event.stageInfo.attemptNumber()),
         new HashMap[String, PeakExecutorMetrics]())
+      logInfo(s"[along]start calculating cpu usage.")
+      jvmCpuUsage.startCalcJvmCpuUsage()
     }
   }
 
@@ -198,6 +204,10 @@ private[spark] class EventLoggingListener(
           }
         }
       }
+
+      val usage = jvmCpuUsage.getJvmCpuUsage()
+
+      logInfo(s"[along]stop calculating cpu usage. cpuUsage=$usage")
     }
 
     // log stage completed event
