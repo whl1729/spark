@@ -82,8 +82,15 @@ public class JVMCPUUsage {
         if (!isConnect) {
             System.out.println("[along]connect to MBean server and MXBean proxy.");
 
-            openMBeanServerConnection();
-            getMXBeanProxyConnections();
+            try {
+                openMBeanServerConnection();
+                getMXBeanProxyConnections();
+            }
+            catch(IOException e) {
+                e.printStackTrace();
+            }
+
+            isConnect = true;
         }
 
         // set old timestamp values
