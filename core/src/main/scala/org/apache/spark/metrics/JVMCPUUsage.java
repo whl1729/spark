@@ -17,6 +17,7 @@
  * Copyright (C) 2017  Lahiru Pathirage <lpsandaruwan@gmail.com> on 3/27/17.
  */
 
+package org.apache.spark.metrics;
 import javax.management.MBeanServerConnection;
 import javax.management.remote.JMXConnector;
 import javax.management.remote.JMXConnectorFactory;
@@ -41,15 +42,6 @@ public class JVMCPUUsage {
     private long prevJvmUptime = 0;
     private long curJvmProcessCpuTime = 0;
     private long curJvmUptime = 0;
-
-    JVMCPUUsage() {
-        System.out.println("[along]JVMCPUUsage initialize start.");
-
-        openMBeanServerConnection();
-        getMXBeanProxyConnections();
-
-        System.out.println("[along]JVMCPUUsage initialize end.");
-    }
 
     // initiate and prepare MBeanServerConnection
     public void openMBeanServerConnection() throws IOException {
