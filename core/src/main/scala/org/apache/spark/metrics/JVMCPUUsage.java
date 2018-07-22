@@ -102,7 +102,7 @@ public class JVMCPUUsage {
         prevJvmProcessCpuTime = peOperatingSystemMXBean.getProcessCpuTime();
         prevJvmUptime = runtimeMXBean.getUptime();
 
-        System.out.printf("[along]startCalcCpuUsage: prevCpuTime=%dns, prevUpTime=%dms.", prevJvmProcessCpuTime, prevJvmUptime);
+        System.out.printf("[along]startCalcCpuUsage: prevCpuTime=%dns, prevUpTime=%dms.\n", prevJvmProcessCpuTime, prevJvmUptime);
     }
 
     // Get JVM CPU usage
@@ -116,18 +116,18 @@ public class JVMCPUUsage {
         long elapsedJvmUptime = curJvmUptime - prevJvmUptime;
 
         // total jvm uptime on all the available processors
-        long totalElapsedJvmUptime = elapsedJvmUptime * operatingSystemMXBean.getAvailableProcessors();
+        long totalElapsedJvmUptime = elapsedJvmUptime * peOperatingSystemMXBean.getAvailableProcessors();
 
         // calculate cpu usage as a percentage value
         // to convert nanoseconds to milliseconds divide it by 1000000 and to get a percentage multiply it by 100
         float cpuUsage = elapsedProcessCpuTime / (totalElapsedJvmUptime * 10000F);
 
-        System.out.printf("[along]getJvmCpuUsage: ");
-        System.out.printf("[along]prevCpuTime=%dns, curCpuTime=%dns, elapsedCpuTime=%dns.",
+        System.out.printf("[along]getJvmCpuUsage: \n");
+        System.out.printf("[along]prevCpuTime=%dns, curCpuTime=%dns, elapsedCpuTime=%dns.\n",
             prevJvmProcessCpuTime, curJvmProcessCpuTime, elapsedProcessCpuTime);
-        System.out.printf("[along]prevUpTime=%dms, curUpTime=%dms, elapsedUpTime=%dms.",
+        System.out.printf("[along]prevUpTime=%dms, curUpTime=%dms, elapsedUpTime=%dms.\n",
             prevJvmUptime, curJvmUptime, elapsedJvmUptime);
-        System.out.printf("[along]cpuUsage=%f.", cpuUsage);
+        System.out.printf("[along]cpuUsage=%f.\n", cpuUsage);
 
         return cpuUsage;
     }
