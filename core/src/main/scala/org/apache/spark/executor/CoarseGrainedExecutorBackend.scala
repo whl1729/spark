@@ -56,7 +56,7 @@ private[spark] class CoarseGrainedExecutorBackend(
   private[this] val ser: SerializerInstance = env.closureSerializer.newInstance()
 
   override def onStart() {
-    logInfo("Connecting to driver: " + driverUrl)
+    logInfo("[along]Connecting to driver: " + driverUrl)
     rpcEnv.asyncSetupEndpointRefByURI(driverUrl).flatMap { ref =>
       // This is a very fast action so we can use "ThreadUtils.sameThread"
       driver = Some(ref)
@@ -78,8 +78,9 @@ private[spark] class CoarseGrainedExecutorBackend(
 
   override def receive: PartialFunction[Any, Unit] = {
     case RegisteredExecutor =>
-      logInfo("Successfully registered with driver")
+      logInfo("[along]Successfully registered with driver")
       try {
+        logInfo(s"[along]start creating new executor $executorId")
         executor = new Executor(executorId, hostname, env, userClassPath, isLocal = false)
       } catch {
         case NonFatal(e) =>

@@ -462,9 +462,9 @@ private[spark] class ExecutorAllocationManager(
     val execCountFloor = math.max(minNumExecutors, numExecutorsTarget)
     val (executorIdsToBeRemoved, dontRemove) = executors
       .filter(canBeKilled)
-      .splitAt(numExistingExecs/2)
+      //.splitAt(numExistingExecs/2)
       // along: modify here to support removing Executors.
-      //.splitAt(numExistingExecs - execCountFloor)
+      .splitAt(numExistingExecs - execCountFloor)
 
     val removeSize = executorIdsToBeRemoved.size
     val dontSize = dontRemove.size

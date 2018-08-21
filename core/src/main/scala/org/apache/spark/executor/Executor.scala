@@ -153,7 +153,7 @@ private[spark] class Executor(
   private val jvmCpuUsage = new JVMCPUUsage
    
   // donglin Executor for the heartbeat task.
-  private val heartbeater = new Heartbeater(env.memoryManager, reportHeartBeat, "executor-heartbeater", conf.getTimeAsMs("spark.executor.heartbeatInterval", "10s"))
+  private val heartbeater = new Heartbeater(env.memoryManager, reportHeartBeat, "executor-heartbeater", conf.getTimeAsMs("spark.executor.heartbeatInterval", "1s"))
 
   // must be initialized before running startDriverHeartbeat()
   private val heartbeatReceiverRef =
@@ -779,7 +779,7 @@ private[spark] class Executor(
     // donglin: get executor level memory metrics
     val executorUpdates = heartbeater.getCurrentMetrics()
 
-    logInfo(s"[along]Executor.reportHeartbeat: getJvmCpuUsage...")
+    logInfo(s"[along]Executor.reportHeartbeat: getJvmCpuUsage for executor $executorId...")
 
     val usage = jvmCpuUsage.getJvmCpuUsage()
 
