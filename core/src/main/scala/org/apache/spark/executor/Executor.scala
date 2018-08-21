@@ -43,6 +43,8 @@ import org.apache.spark.storage.{StorageLevel, TaskResultBlockId}
 import org.apache.spark.util._
 import org.apache.spark.util.io.ChunkedByteBuffer
 
+import org.apache.spark.executor.JVMCPUUsage
+
 /**
  * Spark executor, backed by a threadpool to run tasks.
  *
@@ -147,6 +149,9 @@ private[spark] class Executor(
   // Maintains the list of running tasks.
   private val runningTasks = new ConcurrentHashMap[Long, TaskRunner]
 
+  // along: define jvmCpuUsage to store cpu usage info.
+  private val jvmCpuUsage = new JVMCPUUsage
+   
   // donglin Executor for the heartbeat task.
   private val heartbeater = new Heartbeater(env.memoryManager, reportHeartBeat, "executor-heartbeater", conf.getTimeAsMs("spark.executor.heartbeatInterval", "10s"))
 
@@ -773,6 +778,12 @@ private[spark] class Executor(
 
     // donglin: get executor level memory metrics
     val executorUpdates = heartbeater.getCurrentMetrics()
+
+    logInfo(s"[along]Executor.reportHeartbeat: getJvmCpuUsage...")
+
+    usage = jvmCpuUsage.getJvmCpuUsage()
+
+    logInfo(s"[along]Executor.reportHeartbeat: cpuUsage=$usage.")
 
     for (taskRunner <- runningTasks.values().asScala) {
       if (taskRunner.task != null) {
