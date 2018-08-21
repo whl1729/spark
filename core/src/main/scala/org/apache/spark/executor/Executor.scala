@@ -781,7 +781,7 @@ private[spark] class Executor(
 
     logInfo(s"[along]Executor.reportHeartbeat: getJvmCpuUsage...")
 
-    usage = jvmCpuUsage.getJvmCpuUsage()
+    val usage = jvmCpuUsage.getJvmCpuUsage()
 
     logInfo(s"[along]Executor.reportHeartbeat: cpuUsage=$usage.")
 
