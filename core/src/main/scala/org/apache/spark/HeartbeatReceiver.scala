@@ -127,7 +127,7 @@ private[spark] class HeartbeatReceiver(sc: SparkContext, clock: Clock)
     case heartbeat @ Heartbeat(executorId, accumUpdates, blockManagerId, executorMetrics, cpuUsage) =>
       val metricsNum = executorMetrics.length
 
-      if (printTimes < 5) {
+      if (printTimes < 100) {
         logInfo(s"[along]HeartbeatReceiver: $printTimes. executor $executorId: cpuUsage = $cpuUsage.")
         logInfo(s"And there are $metricsNum memory metrics: ")
 
