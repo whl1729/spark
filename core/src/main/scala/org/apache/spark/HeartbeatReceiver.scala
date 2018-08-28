@@ -95,6 +95,8 @@ private[spark] class HeartbeatReceiver(sc: SparkContext, clock: Clock)
 
   private val killExecutorThread = ThreadUtils.newDaemonSingleThreadExecutor("kill-executor-thread")
 
+  private var printTimes = 0
+
   override def onStart(): Unit = {
     timeoutCheckingTask = eventLoopThread.scheduleAtFixedRate(new Runnable {
       override def run(): Unit = Utils.tryLogNonFatalError {
@@ -121,6 +123,19 @@ private[spark] class HeartbeatReceiver(sc: SparkContext, clock: Clock)
 
     // Messages received from executors
     case heartbeat @ Heartbeat(executorId, accumUpdates, blockManagerId, executorMetrics) =>
+      val metricsNum = executorMetrics.length
+
+      if (printTimes < 5) {
+        logInfo(s"[along]HeartbeatReceiver: $printTimes. there are $metricsNum metrics data of executor $executorId, blockManager $blockManagerId: ")
+
+        for (pos <- 0 to (metricsNum - 1)) {
+          val curMetrics = executorMetrics(pos)
+          logInfo(s"$curMetrics")
+        }
+      }
+
+      printTimes = printTimes + 1
+
       if (scheduler != null) {
         if (executorLastSeen.contains(executorId)) {
           executorLastSeen(executorId) = clock.getTimeMillis()
