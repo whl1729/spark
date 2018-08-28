@@ -214,8 +214,9 @@ class HeartbeatReceiverSuite
     val metrics = TaskMetrics.empty
     val blockManagerId = BlockManagerId(executorId, "localhost", 12345)
     val executorUpdates = Array(123456L, 543L, 12345L, 1234L, 123L, 12L, 432L, 321L, 654L, 765L)
+    val cpuUsage = 0.5
     val response = heartbeatReceiverRef.askSync[HeartbeatResponse](
-      Heartbeat(executorId, Array(1L -> metrics.accumulators()), blockManagerId, executorUpdates))
+      Heartbeat(executorId, Array(1L -> metrics.accumulators()), blockManagerId, executorUpdates, cpuUsage))
     if (executorShouldReregister) {
       assert(response.reregisterBlockManager)
     } else {
