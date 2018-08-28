@@ -39,7 +39,7 @@ private[spark] case class Heartbeat(
     accumUpdates: Array[(Long, Seq[AccumulatorV2[_, _]])], // taskId -> accumulator updates
     blockManagerId: BlockManagerId, 
     executorUpdates: Array[Long],
-    cpuUsage: float)
+    cpuUsage: Float)
 
 /**
  * An event that SparkContext uses to notify HeartbeatReceiver that SparkContext.taskScheduler is
