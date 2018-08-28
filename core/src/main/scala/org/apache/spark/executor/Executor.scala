@@ -793,7 +793,7 @@ private[spark] class Executor(
       }
     }
 
-    val message = Heartbeat(executorId, accumUpdates.toArray, env.blockManager.blockManagerId, executorUpdates)
+    val message = Heartbeat(executorId, accumUpdates.toArray, env.blockManager.blockManagerId, executorUpdates, usage)
     try {
       val response = heartbeatReceiverRef.askSync[HeartbeatResponse](
           message, RpcTimeout(conf, "spark.executor.heartbeatInterval", "10s"))

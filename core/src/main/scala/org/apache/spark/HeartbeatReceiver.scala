@@ -37,7 +37,9 @@ import org.apache.spark.util._
 private[spark] case class Heartbeat(
     executorId: String,
     accumUpdates: Array[(Long, Seq[AccumulatorV2[_, _]])], // taskId -> accumulator updates
-    blockManagerId: BlockManagerId, executorUpdates: Array[Long])
+    blockManagerId: BlockManagerId, 
+    executorUpdates: Array[Long],
+    cpuUsage: float)
 
 /**
  * An event that SparkContext uses to notify HeartbeatReceiver that SparkContext.taskScheduler is
@@ -122,11 +124,12 @@ private[spark] class HeartbeatReceiver(sc: SparkContext, clock: Clock)
       context.reply(true)
 
     // Messages received from executors
-    case heartbeat @ Heartbeat(executorId, accumUpdates, blockManagerId, executorMetrics) =>
+    case heartbeat @ Heartbeat(executorId, accumUpdates, blockManagerId, executorMetrics, cpuUsage) =>
       val metricsNum = executorMetrics.length
 
       if (printTimes < 5) {
-        logInfo(s"[along]HeartbeatReceiver: $printTimes. there are $metricsNum metrics data of executor $executorId, blockManager $blockManagerId: ")
+        logInfo(s"[along]HeartbeatReceiver: $printTimes. executor $executorId: cpuUsage = $cpuUsage.")
+        logInfo(s"And there are $metricsNum memory metrics: ")
 
         for (pos <- 0 to (metricsNum - 1)) {
           val curMetrics = executorMetrics(pos)
