@@ -694,7 +694,7 @@ private[spark] class ExecutorAllocationManager(
       }
     }
 
-    override def CalcExecutorCpuUsage(executorId: String): Unit = {
+    def CalcExecutorCpuUsage(executorId: String): Unit = {
       val cpuMetrics = MetricGetter.GetExecutorCpuUsage(executorId)
       val avgCpuUsage = MetricGetter.GetExecutorAvgCpuUsage(executorId)
 
