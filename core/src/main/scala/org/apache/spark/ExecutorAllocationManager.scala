@@ -694,14 +694,14 @@ private[spark] class ExecutorAllocationManager(
       }
     }
 
-    override def CalcExecutorCpuUsage(executorId: string): Unit = {
+    override def CalcExecutorCpuUsage(executorId: String): Unit = {
       val cpuMetrics = MetricGetter.GetExecutorCpuUsage(executorId)
       val avgCpuUsage = MetricGetter.GetExecutorAvgCpuUsage(executorId)
 
       logInfo(s"The recent ${cpuMetrics.length} cpuUsage of executor $executorId is:")
 
       for (pos <- 0 to (cpuMetrics.length - 1)) {
-        logInfo(s"${curMetrics(pos)}")
+        logInfo(s"${cpuMetrics(pos)}")
       }
 
       logInfo(s"The average cpuUsage of executor $executorId is: $avgCpuUsage")
@@ -712,9 +712,7 @@ private[spark] class ExecutorAllocationManager(
 
       logInfo(s"[along]onStageCompleted: stageId=$stageId")
 
-      executorIds.keys.foreach { executorId =>
-        CalcExecutorCpuUsage(executorId)
-      }
+      executorIds.foreach(CalcExecutorCpuUsage(_))
 
       allocationManager.synchronized {
         stageIdToNumTasks -= stageId

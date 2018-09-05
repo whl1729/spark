@@ -129,9 +129,9 @@ private[spark] class HeartbeatReceiver(sc: SparkContext, clock: Clock)
       if (printTimes < 1000) {
         logInfo(s"[along]HeartbeatReceiver: $printTimes. Receive heartbeat from executor $executorId.")
         logInfo(s"The current cpuUsage of executor $executorId is: $cpuUsage")
-        logInfo(s"The ${executorMetrics.length} memory metrics of executor $exeuctorId is : ")
+        logInfo(s"The ${executorMetrics.length} memory metrics of executor $executorId is : ")
 
-        for (pos <- 0 to (${executorMetrics.length} - 1)) {
+        for (pos <- 0 to (executorMetrics.length - 1)) {
           logInfo(s"${executorMetrics(pos)}")
         }
 

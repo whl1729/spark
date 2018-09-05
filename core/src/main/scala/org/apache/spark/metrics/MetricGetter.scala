@@ -19,6 +19,7 @@ package org.apache.spark.metrics
 import java.lang.management.{BufferPoolMXBean, ManagementFactory}
 import javax.management.ObjectName
 
+import scala.collection.mutable
 import org.apache.spark.memory.MemoryManager
 
 private[spark] sealed trait MetricGetter {
@@ -122,12 +123,12 @@ private[spark] object MetricGetter {
     cpuUsages -= executorId
   }
 
-  def GetExecutorCpuUsage(executorId: String, usage: Float): Array[Float] = {
+  def GetExecutorCpuUsage(executorId: String): Array[Float] = {
     return cpuUsages(executorId)
   }
 
-  def GetExecutorAvgCpuUsage(executorId: String, usage: Float): Float = {
-    val avgCpuUsage = 0.0f
+  def GetExecutorAvgCpuUsage(executorId: String): Float = {
+    var avgCpuUsage = 0.0f
     
     for (i <- 0 to (cpuUsages(executorId).length - 1)) {
       avgCpuUsage += cpuUsages(executorId)(i)
