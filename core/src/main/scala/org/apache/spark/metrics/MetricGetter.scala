@@ -112,11 +112,13 @@ private[spark] object MetricGetter {
       InitExecutorCpuUsage(executorId)
     }
 
-    for (i <- 0 to (cpuUsages(executorId).length - 2)) {
-      cpuUsages(executorId)(i) = cpuUsages(exeuctorId)(i+1)
+    val len = cpuUsages(executorId).length
+
+    for (i <- 0 to (len - 2)) {
+      cpuUsages(executorId)(i) = cpuUsages(executorId)(i+1)
     }
 
-    cpuUsages(executorId)(arr.length - 1) = usage
+    cpuUsages(executorId)(len - 1) = usage
   }
 
   def ClearExecutorCpuUsage(executorId: String): Unit = {
