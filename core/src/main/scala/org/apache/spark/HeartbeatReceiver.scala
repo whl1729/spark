@@ -27,6 +27,7 @@ import org.apache.spark.rpc.{RpcCallContext, RpcEnv, ThreadSafeRpcEndpoint}
 import org.apache.spark.scheduler._
 import org.apache.spark.storage.BlockManagerId
 import org.apache.spark.util._
+import org.apache.spark.metrics.MetricGetter
 
 /**
  * A heartbeat from executors to the driver. This is a shared message used by several internal
@@ -125,15 +126,24 @@ private[spark] class HeartbeatReceiver(sc: SparkContext, clock: Clock)
 
     // Messages received from executors
     case heartbeat @ Heartbeat(executorId, accumUpdates, blockManagerId, executorMetrics, cpuUsage) =>
-      val metricsNum = executorMetrics.length
+      if (printTimes < 1000) {
+        logInfo(s"[along]HeartbeatReceiver: $printTimes. Receive heartbeat from executor $executorId.")
+        logInfo(s"The current cpuUsage of executor $executorId is: $cpuUsage")
+        logInfo(s"The ${executorMetrics.length} memory metrics of executor $exeuctorId is : ")
 
-      if (printTimes < 100) {
-        logInfo(s"[along]HeartbeatReceiver: $printTimes. executor $executorId: cpuUsage = $cpuUsage.")
-        logInfo(s"And there are $metricsNum memory metrics: ")
+        for (pos <- 0 to (${executorMetrics.length} - 1)) {
+          logInfo(s"${executorMetrics(pos)}")
+        }
 
-        for (pos <- 0 to (metricsNum - 1)) {
-          val curMetrics = executorMetrics(pos)
-          logInfo(s"$curMetrics")
+        MetricGetter.UpdateExecutorCpuUsage(executorId, cpuUsage)
+
+        val cpuMetrics = MetricGetter.GetExecutorCpuUsage(executorId)
+        
+
+        logInfo(s"The recent ${cpuMetrics.length} cpuUsage of executor $executorId is:")
+
+        for (pos <- 0 to (cpuMetrics.length - 1)) {
+          logInfo(s"${cpuMetrics(pos)}")
         }
       }
 

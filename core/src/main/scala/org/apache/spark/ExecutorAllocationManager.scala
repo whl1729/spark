@@ -28,6 +28,7 @@ import com.codahale.metrics.{Gauge, MetricRegistry}
 import org.apache.spark.internal.Logging
 import org.apache.spark.internal.config._
 import org.apache.spark.metrics.source.Source
+import org.apache.spark.metrics.MetricGetter
 import org.apache.spark.scheduler._
 import org.apache.spark.storage.BlockManagerMaster
 import org.apache.spark.util.{Clock, SystemClock, ThreadUtils, Utils}
@@ -693,9 +694,28 @@ private[spark] class ExecutorAllocationManager(
       }
     }
 
+    override def CalcExecutorCpuUsage(executorId: string): Unit = {
+      val cpuMetrics = MetricGetter.GetExecutorCpuUsage(executorId)
+      val avgCpuUsage = MetricGetter.GetExecutorAvgCpuUsage(executorId)
+
+      logInfo(s"The recent ${cpuMetrics.length} cpuUsage of executor $executorId is:")
+
+      for (pos <- 0 to (cpuMetrics.length - 1)) {
+        logInfo(s"${curMetrics(pos)}")
+      }
+
+      logInfo(s"The average cpuUsage of executor $executorId is: $avgCpuUsage")
+    }
+
     override def onStageCompleted(stageCompleted: SparkListenerStageCompleted): Unit = {
-      logInfo(s"[along]onStageCompleted...")
       val stageId = stageCompleted.stageInfo.stageId
+
+      logInfo(s"[along]onStageCompleted: stageId=$stageId")
+
+      executorIds.keys.foreach { executorId =>
+        CalcExecutorCpuUsage(executorId)
+      }
+
       allocationManager.synchronized {
         stageIdToNumTasks -= stageId
         stageIdToNumRunningTask -= stageId

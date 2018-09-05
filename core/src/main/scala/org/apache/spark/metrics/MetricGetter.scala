@@ -92,5 +92,49 @@ private[spark] object MetricGetter {
     MappedPoolMemory
   )
 
+  val cpuUsages = new mutable.HashMap[String, Array[Float]]
+
   val idxAndValues = values.zipWithIndex.map(_.swap)
+
+  def InitExecutorCpuUsage(executorId: String): Unit = {
+    val arr = new Array[Float](5)
+
+    for (i <- 0 to (arr.length - 1)) {
+      arr(i) = 100
+    }
+
+    cpuUsages(executorId) = arr
+  }
+
+  def UpdateExecutorCpuUsage(executorId: String, usage: Float): Unit = {
+    if (!cpuUsages.contains(executorId)) {
+      InitExecutorCpuUsage(executorId)
+    }
+
+    for (i <- 0 to (cpuUsages(executorId).length - 2)) {
+      cpuUsages(executorId)(i) = cpuUsages(exeuctorId)(i+1)
+    }
+
+    cpuUsages(executorId)(arr.length - 1) = usage
+  }
+
+  def ClearExecutorCpuUsage(executorId: String): Unit = {
+    cpuUsages -= executorId
+  }
+
+  def GetExecutorCpuUsage(executorId: String, usage: Float): Array[Float] = {
+    return cpuUsages(executorId)
+  }
+
+  def GetExecutorAvgCpuUsage(executorId: String, usage: Float): Float = {
+    val avgCpuUsage = 0.0f
+    
+    for (i <- 0 to (cpuUsages(executorId).length - 1)) {
+      avgCpuUsage += cpuUsages(executorId)(i)
+    }
+
+    avgCpuUsage /= cpuUsages(executorId).length
+
+    return avgCpuUsage
+  }
 }
